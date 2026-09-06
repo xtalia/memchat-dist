@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      6.1.0
+// @version      6.2.0
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -25,7 +25,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '6.1.0';
+const MEMCHAT_VERSION = '6.2.0';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -103,6 +103,7 @@ let calcRules     = [];
 let scheduleReplacements = {};
 let currentHatikoPathname = '';
 let lastHatikoResults = [];
+let lastHatikoQuery = '';
 let hatikoSearchMode = 'auto';
 let activeRequestId = 0;
 
@@ -261,6 +262,44 @@ function resetFloatWindowPos() {
         localStorage.removeItem(storageKey('floatWindowPos_v1'));
     } catch (error) {
         debugError('storage', 'Не удалось сбросить позицию окна', error);
+    }
+}
+
+// ─── Персист истории чата ─────────────────────────────────────────────────────
+// Вкладку «Бонусы» (номера телефонов клиентов, ПДн) НЕ персистим.
+const HISTORY_STORAGE_KEY = 'chatHistory_v1';
+const HISTORY_MAX_PER_TAB = 100;
+
+function saveChatHistory() {
+    try {
+        const safe = {};
+        Object.entries(chatHistoryByAction).forEach(([action, entries]) => {
+            if (action === 'checkHatikoBonuses') return;
+            if (!Array.isArray(entries)) return;
+            safe[action] = entries.slice(-HISTORY_MAX_PER_TAB);
+        });
+        localStorage.setItem(storageKey(HISTORY_STORAGE_KEY), JSON.stringify(safe));
+    } catch (error) {
+        debugError('storage', 'Не удалось сохранить историю', error);
+    }
+}
+
+function loadChatHistory() {
+    try {
+        const raw = localStorage.getItem(storageKey(HISTORY_STORAGE_KEY));
+        if (!raw) return;
+        const saved = JSON.parse(raw);
+        if (!saved || typeof saved !== 'object') return;
+        Object.entries(saved).forEach(([action, entries]) => {
+            if (action === 'checkHatikoBonuses') return; // ПДн — не восстанавливаем
+            if (!MODE_ACTIONS.includes(action)) return;  // только режимные вкладки
+            if (!Array.isArray(entries)) return;
+            chatHistoryByAction[action] = entries
+                .filter(e => e && typeof e.message === 'string')
+                .slice(-HISTORY_MAX_PER_TAB);
+        });
+    } catch (error) {
+        debugError('storage', 'Не удалось загрузить историю', error);
     }
 }
 
@@ -504,10 +543,15 @@ function applyRule(cash, rule) {
 /* ===== 03-chat.js ===== */
 
 // ─── addToChatHistory ─────────────────────────────────────────────────────────
-function addToChatHistory(sender, message, emoji = '') {
+// sender: user | bot | system; query — текст запроса (для кнопки «повторить»).
+function addToChatHistory(sender, message, emoji = '', query) {
     const ts = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-    historyFor(currentAction).push({ sender, message, emoji, timestamp: ts });
+    const entry = { sender, message, emoji, timestamp: ts, action: currentAction, query: query || '' };
+    const history = historyFor(currentAction);
+    history.push(entry);
+    if (history.length > 100) history.splice(0, history.length - 100); // лимит на вкладку
     if (window.priceCheckContainer) renderChat();
+    saveChatHistory(); // персист (кроме вкладки «Бонусы» — ПДн)
     if (sender === 'user' && document.getElementById('clearTextCheckbox')?.checked) {
         const ms = parseInt(document.getElementById('timeoutSlider')?.value || 500, 10);
         setTimeout(() => { const inp = document.getElementById('priceCheckInput'); if (inp) inp.value = ''; }, ms);
@@ -544,34 +588,71 @@ function renderMessageBubble(entry) {
     bubble.appendChild(body);
 
     if (entry.sender === 'bot') {
+        const actions = document.createElement('div');
+        actions.className = 'mc-msg-actions';
+
         const copy = document.createElement('button');
         copy.type = 'button';
         copy.className = 'mc-copy-btn';
         copy.dataset.copy = entry.message; // текст для копирования
-        copy.textContent = '📋 Копировать';
-        bubble.appendChild(copy);
+        copy.dataset.tip = '📋 Копировать';
+        copy.textContent = '📋';
+        actions.appendChild(copy);
+
+        // Повторить запрос (если известен исходный запрос и это режимная вкладка)
+        if (entry.action && MODE_ACTIONS.includes(entry.action) && entry.query) {
+            const retry = document.createElement('button');
+            retry.type = 'button';
+            retry.className = 'mc-retry-btn';
+            retry.dataset.tip = '🔁 Повторить запрос';
+            retry.textContent = '🔁';
+            actions.appendChild(retry);
+        }
+        bubble.appendChild(actions);
     }
     return bubble;
 }
 
-// Делегированный клик по кнопкам «Копировать» в ленте.
+// Делегированный клик по кнопкам «Копировать» / «Повторить» в ленте.
 function handleChatLogClick(event) {
-    const btn = event.target.closest('.mc-copy-btn');
-    if (!btn) return;
-    copyHatikoText(btn.dataset.copy || '');
-    const original = btn.textContent;
-    btn.textContent = '✅ Скопировано';
-    btn.classList.add('mc-copy-done');
+    const copyBtn = event.target.closest('.mc-copy-btn');
+    if (copyBtn) {
+        copyHatikoText(copyBtn.dataset.copy || '');
+        copyBtn.textContent = '✅';
+        copyBtn.classList.add('mc-copy-done');
+        setTimeout(() => {
+            copyBtn.textContent = '📋';
+            copyBtn.classList.remove('mc-copy-done');
+        }, 1200);
+        return;
+    }
+
+    const retryBtn = event.target.closest('.mc-retry-btn');
+    if (!retryBtn) return;
+    const bubble = retryBtn.closest('.mc-msg');
+    const index = Array.from(bubble.parentNode.children).indexOf(bubble);
+    const entry = (chatHistoryByAction[currentAction] || [])[index];
+    if (!entry) return;
+
+    retryBtn.textContent = '✅';
+    retryBtn.classList.add('mc-copy-done');
     setTimeout(() => {
-        btn.textContent = original;
-        btn.classList.remove('mc-copy-done');
+        retryBtn.textContent = '🔁';
+        retryBtn.classList.remove('mc-copy-done');
     }, 1200);
+
+    // Повторяем тот же запрос в той же вкладке
+    if (currentAction !== entry.action) selectTab(entry.action);
+    const input = document.getElementById('priceCheckInput');
+    if (input) input.value = entry.query;
+    executeCurrentAction();
 }
 
 function clearChat() {
     // Очищает только историю активной вкладки
     if (currentAction) delete chatHistoryByAction[currentAction];
     renderChat();
+    saveChatHistory();
 }
 
 function clearResultForNewRequest() {
@@ -694,16 +775,16 @@ function checkHatiko() {
             const message = formatPanelSearchResult(data);
             if (message) {
                 updateHatikoStatus('Panel: готово');
-                addToChatHistory('bot', message, '🏪 Panel');
+                addToChatHistory('bot', message, '🏪 Panel', query);
             } else if (hatikoSearchMode === 'auto') {
                 updateHatikoStatus('Panel не нашёл, переключаюсь на Hatiko…');
                 checkHatikoWebsite(query, requestId);
-            } else addToChatHistory('bot', 'Panel: товар не найден', '🏪 Panel');
+            } else addToChatHistory('bot', 'Panel: товар не найден', '🏪 Panel', query);
         }, error => {
             if (hatikoSearchMode === 'auto') {
                 updateHatikoStatus('Panel недоступна, переключаюсь на Hatiko…');
                 checkHatikoWebsite(query, requestId);
-            } else addToChatHistory('bot', error.message, '🏪 Panel');
+            } else addToChatHistory('bot', error.message, '🏪 Panel', query);
         });
         return;
     }
@@ -724,7 +805,7 @@ function checkHatikoWebsite(query, requestId) {
 
             if (!products.length) {
                 updateHatikoStatus('Товары не найдены');
-                addToChatHistory('bot', 'Товар не найден', '🐶 Hatiko');
+                addToChatHistory('bot', 'Товар не найден', '🐶 Hatiko', query);
                 return;
             }
 
@@ -742,19 +823,21 @@ function checkHatikoWebsite(query, requestId) {
 
                     if (results.length === 1) {
                         lastHatikoResults = results;
+                        lastHatikoQuery = query;
                         updateHatikoStatus('Готово');
-                        addToChatHistory('bot', results[0].message, '🐶 Hatiko');
+                        addToChatHistory('bot', results[0].message, '🐶 Hatiko', query);
                     } else {
                         lastHatikoResults = results;
+                        lastHatikoQuery = query;
                         updateHatikoStatus(`Готово: ${results.length} товара. Можно выбрать другой.`);
-                        openHatikoProductPicker(results);
+                        openHatikoProductPicker(results, query);
                     }
                 });
             });
         },
         (err) => {
             updateHatikoStatus('Ошибка поиска');
-            addToChatHistory('bot', 'Ошибка поиска: ' + err, '🐶 Hatiko');
+            addToChatHistory('bot', 'Ошибка поиска: ' + err, '🐶 Hatiko', query);
         }
     );
 }
@@ -786,10 +869,10 @@ function checkHatikoBonuses() {
             `Телефон: ${data.phone || phone}`,
             `Клиент: ${data.name || data.customer_name || '—'}`,
             `Бонусы: ${Math.round(Number(bonus))}`
-        ].join('\n'), '🎁 Бонусы');
+        ].join('\n'), '🎁 Бонусы', phone);
     }, error => {
         updateHatikoStatus('Ошибка проверки бонусов');
-        addToChatHistory('bot', error.message, '🎁 Бонусы');
+        addToChatHistory('bot', error.message, '🎁 Бонусы', phone);
     });
 }
 
@@ -841,17 +924,17 @@ function calculateCredit() {
     addToChatHistory('user', input, '🧮 Калькулятор');
     const cash = parseFloat(input);
     if (isNaN(cash) || cash <= 0) {
-        addToChatHistory('bot', 'Ошибка: введите корректную сумму.', '🧮 Калькулятор');
+        addToChatHistory('bot', 'Ошибка: введите корректную сумму.', '🧮 Калькулятор', input);
         return;
     }
     const lines = calcRules.map(rule => {
-        const result = applyRule(cash, rule);
-        return rule.isCashback
-            ? `💸 ${rule.name}: ${result} баллами`
-            : `🔹 ${rule.name}: ${result} руб.`;
-    });
-    addToChatHistory('bot', lines.join('\n'), '🧮 Калькулятор');
-}
+            const result = applyRule(cash, rule);
+            return rule.isCashback
+                ? `💸 ${rule.name}: ${result} баллами`
+                : `🔹 ${rule.name}: ${result} руб.`;
+        });
+        addToChatHistory('bot', lines.join('\n'), '🧮 Калькулятор', input);
+    }
 
 function calculateReverse() {
     const input = document.getElementById('priceCheckInput').value.trim();
@@ -859,7 +942,7 @@ function calculateReverse() {
     addToChatHistory('user', input, '🔄 Реверс');
     const amount = parseFloat(input);
     if (isNaN(amount) || amount <= 0) {
-        addToChatHistory('bot', 'Ошибка: введите корректную сумму.', '🔄 Реверс');
+        addToChatHistory('bot', 'Ошибка: введите корректную сумму.', '🔄 Реверс', input);
         return;
     }
     const lines = calcRules
@@ -868,7 +951,7 @@ function calculateReverse() {
             const original = Math.round((amount - (r.extra || 0)) / r.percent * 100);
             return `🔹 ${r.name}: ${original} руб.`;
         });
-    addToChatHistory('bot', '🔄 РЕВЕРС расчёта:\n' + lines.join('\n'), '🔄 Реверс');
+    addToChatHistory('bot', '🔄 РЕВЕРС расчёта:\n' + lines.join('\n'), '🔄 Реверс', input);
 }
 
 /**
@@ -909,11 +992,11 @@ function applyDiscountOrMarkup() {
     const verb   = op === '-' ? 'Скидка'    : 'Наценка';
 
     addToChatHistory('bot',
-        `${label}:\n` +
-        `🔹 Было: ${orig} руб.\n` +
-        `🔹 ${verb}: ${diff} руб. (${pct}%)\n` +
-        `🔹 Итого: ${result} руб.`,
-        '🎉');
+            `${label}:\n` +
+            `🔹 Было: ${orig} руб.\n` +
+            `🔹 ${verb}: ${diff} руб. (${pct}%)\n` +
+            `🔹 Итого: ${result} руб.`,
+            '🎉', input);
 }
 
 function calculateSimple() {
@@ -922,7 +1005,7 @@ function calculateSimple() {
     addToChatHistory('user', input, '∑ Простой');
     try {
         const result = Function('"use strict"; return (' + input + ')')();
-        addToChatHistory('bot', `Результат: ${result}`, '∑ Простой');
+        addToChatHistory('bot', `Результат: ${result}`, '∑ Простой', input);
     } catch {
         addToChatHistory('bot', 'Ошибка: некорректное выражение', '∑ Простой');
     }
@@ -1555,7 +1638,15 @@ function createPriceCheckWindow() {
                                         cursor: pointer; transition: all .15s;
                                     }
                                     .mc-copy-btn:hover { background: #eef2ff; border-color: #818cf8; }
-                                    .mc-copy-done { background: #dcfce7 !important; border-color: #86efac !important; color: #166534 !important; }
+                                                            .mc-copy-done { background: #dcfce7 !important; border-color: #86efac !important; color: #166534 !important; }
+                                                            .mc-retry-btn {
+                                                                display: inline-block; margin-top: 5px; padding: 2px 8px;
+                                                                border: 1px solid #a5d6f2; border-radius: 6px;
+                                                                background: #ffffff; color: #1d4ed8; font-size: 9.5px; font-weight: 600;
+                                                                cursor: pointer; transition: all .15s;
+                                                            }
+                                                            .mc-retry-btn:hover { background: #dbeafe; border-color: #60a5fa; }
+                                                            .mc-msg-actions { display: flex; gap: 4px; flex-wrap: wrap; }
 
                         /* ── Нижняя панель ── */
                         #mcBottomBar {
@@ -1722,8 +1813,8 @@ function createPriceCheckWindow() {
             <!-- ── Нижняя панель: статус + действия + настройки + очистка ── -->
                         <div id="mcBottomBar" style="flex:0 0 auto;display:flex;justify-content:flex-end;gap:6px;align-items:center;">
                             <span id="mcStatusBar" class="mc-status-bar">Наведите на кнопку…</span>
-                            <button id="mcActionToday" class="mc-action-btn" type="button" data-tip="👨‍💼 Кто работает сегодня">👨‍💼</button>
-                            <button id="mcActionTomorrow" class="mc-action-btn" type="button" data-tip="📅 Кто работает завтра">📅</button>
+                            <button id="mcActionToday" class="mc-action-btn" type="button" data-tip="👨‍💼 Кто работает сегодня">🟢📅</button>
+                            <button id="mcActionTomorrow" class="mc-action-btn" type="button" data-tip="📅 Кто работает завтра">🟡📅</button>
                             <button id="mcActionHacker" class="mc-action-btn" type="button" data-tip="🐱‍👨‍💻 ХатикоХакер — будущие задачи">🐱‍👨‍💻</button>
                             <button id="mcActionSettings" class="mc-action-btn" type="button" data-tip="⚙️ Настройки">⚙️</button>
                             <button id="mcClearChatButton" class="mc-btn-clear" type="button" data-tip="🗑 Очистить историю этой вкладки">🗑</button>
@@ -1796,7 +1887,7 @@ function closeHatikoProductPicker() {
 }
 
 function reopenHatikoProductPicker() {
-    if (lastHatikoResults.length > 1) openHatikoProductPicker(lastHatikoResults);
+    if (lastHatikoResults.length > 1) openHatikoProductPicker(lastHatikoResults, lastHatikoQuery);
 }
 
 function copyHatikoText(text) {
@@ -1824,7 +1915,7 @@ function escapeHtml(value) {
     }[char]));
 }
 
-function openHatikoProductPicker(results) {
+function openHatikoProductPicker(results, query) {
     closeHatikoProductPicker();
 
     const overlay = document.createElement('div');
@@ -1880,7 +1971,7 @@ function openHatikoProductPicker(results) {
         card.addEventListener('mouseleave', () => { card.style.borderColor = '#334155'; card.style.transform = 'none'; });
         card.addEventListener('click', () => {
             copyHatikoText(result.message);
-            addToChatHistory('bot', result.message, '🐶 Hatiko');
+            addToChatHistory('bot', result.message, '🐶 Hatiko', query);
             addToChatHistory('system', 'Ответ выбранного товара скопирован', '📋');
             closeHatikoProductPicker();
             const reopenButton = document.getElementById('hatikoReopenPickerButton');
@@ -1917,6 +2008,84 @@ function openHatikoProductPicker(results) {
 function setStatusText(message) {
     const bar = document.getElementById('mcStatusBar');
     if (bar) bar.textContent = message;
+}
+
+// ─── Экспорт / импорт настроек ────────────────────────────────────────────────
+function buildSettingsSnapshot() {
+    return {
+        calcRules,
+        scheduleReplacements,
+        clearTextEnabled,
+        clearTimeout: parseInt(document.getElementById('timeoutSlider')?.value || 500, 10),
+        showHatikoLinks: loadShowHatikoLinks(),
+        hatikoSearchMode
+    };
+}
+
+function exportSettings() {
+    copyHatikoText(JSON.stringify(buildSettingsSnapshot(), null, 2));
+    const btn = document.getElementById('exportSettingsBtn');
+    if (btn) {
+        const prev = btn.textContent;
+        btn.textContent = '✅ Скопировано';
+        setTimeout(() => { btn.textContent = prev; }, 1200);
+    }
+    setStatusText('✅ Настройки скопированы в буфер');
+}
+
+function importSettings(jsonText) {
+    let data;
+    try {
+        data = JSON.parse(jsonText);
+        if (!data || typeof data !== 'object') throw new Error('empty');
+    } catch (e) {
+        const area = document.getElementById('mcImportArea');
+        if (area) { area.style.borderColor = '#ef4444'; area.style.borderWidth = '2px'; }
+        setStatusText('⚠️ Некорректный JSON настроек');
+        return false;
+    }
+
+    if (Array.isArray(data.calcRules) && data.calcRules.every(r => r && typeof r.name === 'string')) {
+        calcRules = data.calcRules;
+        saveCalcRules();
+        buildCalcRulesPanel();
+    }
+    if (data.scheduleReplacements && typeof data.scheduleReplacements === 'object' && !Array.isArray(data.scheduleReplacements)) {
+        scheduleReplacements = data.scheduleReplacements;
+        saveScheduleReplacements();
+        buildSchedulePanel();
+    }
+    if (typeof data.clearTextEnabled === 'boolean') {
+        clearTextEnabled = data.clearTextEnabled;
+        localStorage.setItem('clearTextEnabled', String(clearTextEnabled));
+        const cb = document.getElementById('clearTextCheckbox');
+        if (cb) cb.checked = clearTextEnabled;
+        updateClearTextButton();
+    }
+    if (typeof data.clearTimeout === 'number' && data.clearTimeout >= 1 && data.clearTimeout <= 2000) {
+        const slider = document.getElementById('timeoutSlider');
+        const label = document.getElementById('timeoutValue');
+        if (slider) slider.value = data.clearTimeout;
+        if (label) label.textContent = data.clearTimeout;
+    }
+    if (typeof data.showHatikoLinks === 'boolean') {
+        saveShowHatikoLinks(data.showHatikoLinks);
+        const cb = document.getElementById('showHatikoLinksCheckbox');
+        if (cb) cb.checked = data.showHatikoLinks;
+        updateHatikoLinksPanel(currentHatikoPathname);
+    }
+    if (['auto', 'panel', 'hatiko'].includes(data.hatikoSearchMode)) {
+        saveHatikoSearchMode(data.hatikoSearchMode);
+        const sel = document.getElementById('hatikoSearchMode');
+        if (sel) sel.value = data.hatikoSearchMode;
+    }
+
+    const area = document.getElementById('mcImportArea');
+    const actions = document.getElementById('mcImportActions');
+    if (area) { area.style.display = 'none'; area.value = ''; area.style.borderColor = '#cbd5e1'; area.style.borderWidth = '1px'; }
+    if (actions) actions.style.display = 'none';
+    setStatusText('✅ Настройки импортированы');
+    return true;
 }
 
 // ─── Заглушка «ХатикоХакер» ───────────────────────────────────────────────────
@@ -2026,6 +2195,17 @@ function openSettingsWindow() {
 
         <div style="height:8px;"></div>
         <button id="resetFloatPosBtn" class="mc-btn mc-btn-orange" style="width:100%;" data-tip="↺ Вернуть окна в позицию по умолчанию">↺ Сбросить положение окон</button>
+
+        <div style="height:8px;"></div>
+        <div style="display:flex;gap:6px;">
+            <button id="exportSettingsBtn" class="mc-btn mc-btn-slate" style="flex:1;" data-tip="📋 Скопировать все настройки в буфер">📤 Экспорт</button>
+            <button id="importSettingsBtn" class="mc-btn mc-btn-slate" style="flex:1;" data-tip="📥 Вставить настройки из буфера">📥 Импорт</button>
+        </div>
+        <textarea id="mcImportArea" spellcheck="false" placeholder='Вставьте сюда JSON настроек…' style="display:none;width:100%;height:110px;margin-top:6px;padding:7px;background:#fff;border:1px solid #cbd5e1;border-radius:8px;color:#334155;font-size:10.5px;font-family:monospace;box-sizing:border-box;resize:vertical;outline:none;"></textarea>
+        <div id="mcImportActions" style="display:none;gap:6px;margin-top:6px;">
+            <button id="mcImportApply" class="mc-btn mc-btn-green" style="flex:1;">Применить</button>
+            <button id="mcImportCancel" class="mc-btn mc-btn-slate" style="flex:1;">Отмена</button>
+        </div>
     `;
     win.appendChild(body);
 
@@ -2055,6 +2235,28 @@ function openSettingsWindow() {
         resetFloatWindowPos();
         closeMemchatOverlay();
         setStatusText('✅ Положение окон сброшено');
+    });
+
+    // Экспорт / импорт настроек
+    document.getElementById('exportSettingsBtn').addEventListener('click', exportSettings);
+    document.getElementById('importSettingsBtn').addEventListener('click', () => {
+        const area = document.getElementById('mcImportArea');
+        const actions = document.getElementById('mcImportActions');
+        if (!area || !actions) return;
+        const showing = area.style.display !== 'none';
+        area.style.display = showing ? 'none' : 'block';
+        actions.style.display = showing ? 'none' : 'flex';
+        if (!showing) area.focus();
+    });
+    document.getElementById('mcImportApply').addEventListener('click', () => {
+        importSettings(document.getElementById('mcImportArea')?.value || '');
+    });
+    document.getElementById('mcImportCancel').addEventListener('click', () => {
+        const area = document.getElementById('mcImportArea');
+        const actions = document.getElementById('mcImportActions');
+        if (area) { area.style.display = 'none'; area.value = ''; area.style.borderColor = '#cbd5e1'; area.style.borderWidth = '1px'; }
+        if (actions) actions.style.display = 'none';
+        setStatusText('Наведите на кнопку…');
     });
     buildCalcRulesPanel();
     buildSchedulePanel();
@@ -2178,6 +2380,7 @@ function initialize() {
     installDebugHandlers();
     loadCalcRules();
     loadScheduleReplacements();
+    loadChatHistory();
     startPanelBridgeListener();
     schedulePanelCsrfRefresh();
     GM_registerMenuCommand('Открыть мемный чат', createPriceCheckWindow);
@@ -2185,7 +2388,7 @@ function initialize() {
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v6.1.0 инициализирован');
+    console.log('Мемный чат v6.2.0 инициализирован');
 }
 
 // ─── Production entrypoint ───────────────────────────────────────────────────
