@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      5.5.1
-// @description  Улучшенный чат с функциями проверки цен, калькулятором и управлением через кнопки
+// @version      6.1.0
+// @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
 // @match        https://*.hatiko.ru/*
@@ -25,7 +25,14 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '5.5.1';
+const MEMCHAT_VERSION = '6.1.0';
+
+// Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
+// (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
+const MODE_ACTIONS = [
+    'checkHatiko', 'checkHatikoBonuses',
+    'calculator', 'calculator_reverse', 'calculator_discount', 'calculator_simple'
+];
 
 // ─── Константы ───────────────────────────────────────────────────────────────
 const BASE_URLS = [
@@ -87,8 +94,11 @@ const DEFAULT_REPLACEMENTS = {
 let isDragging    = false;
 let offset        = { x: 0, y: 0 };
 let currentAction = null;
-let chatHistory   = [];
+// История чата: по массиву на вкладку (switch-key), живёт только в памяти сессии.
+// Вкладку «Бонусы» намеренно не персистим — там номера телефонов клиентов (ПДн).
+let chatHistoryByAction = {};
 let clearTextEnabled = false;
+let globalClearKeypressBound = false;
 let calcRules     = [];
 let scheduleReplacements = {};
 let currentHatikoPathname = '';
@@ -97,6 +107,17 @@ let hatikoSearchMode = 'auto';
 let activeRequestId = 0;
 
 const DEBUG_STORAGE_KEY = 'memchat:debug';
+
+// ─── История чата по вкладкам ─────────────────────────────────────────────────
+function historyFor(action) {
+    const key = action || 'checkHatiko';
+    if (!chatHistoryByAction[key]) chatHistoryByAction[key] = [];
+    return chatHistoryByAction[key];
+}
+
+function activeHistory() {
+    return historyFor(currentAction);
+}
 
 function isDebugEnabled() {
     try {
@@ -211,6 +232,36 @@ function saveHatikoSearchMode(mode) {
     if (!['auto', 'panel', 'hatiko'].includes(mode)) return;
     hatikoSearchMode = mode;
     localStorage.setItem(storageKey('hatikoSearchMode_v1'), mode);
+}
+
+// Позиция плавающих окон (расписание, настройки, Хакер) — общая и переживает сессии.
+function loadFloatWindowPos() {
+    try {
+        const p = JSON.parse(localStorage.getItem(storageKey('floatWindowPos_v1')) || 'null');
+        return (p && typeof p.left === 'number' && typeof p.top === 'number') ? p : null;
+    } catch {
+        return null;
+    }
+}
+
+function saveFloatWindowPos(left, top) {
+    try {
+        localStorage.setItem(storageKey('floatWindowPos_v1'), JSON.stringify({
+            left: parseInt(left, 10),
+            top: parseInt(top, 10)
+        }));
+    } catch (error) {
+        debugError('storage', 'Не удалось сохранить позицию окна', error);
+    }
+}
+
+// Сброс позиции плавающих окон (если окно «уехало» за пределы экрана).
+function resetFloatWindowPos() {
+    try {
+        localStorage.removeItem(storageKey('floatWindowPos_v1'));
+    } catch (error) {
+        debugError('storage', 'Не удалось сбросить позицию окна', error);
+    }
 }
 
 function panelCsrfStorageKey() {
@@ -454,34 +505,76 @@ function applyRule(cash, rule) {
 
 // ─── addToChatHistory ─────────────────────────────────────────────────────────
 function addToChatHistory(sender, message, emoji = '') {
-    const ts = new Date().toLocaleString();
-    const map = {
-        user:   `=== Я — ${ts} — ${emoji} ===\n${message}\n\n`,
-        bot:    `=== Ответ — ${emoji} — ${ts} ===\n${message}\n\n`,
-        system: `=== Система — ${ts} ===\n${message}\n\n`
-    };
-    chatHistory.push({ sender, message, emoji, timestamp: ts });
-    const ta = document.getElementById('priceCheckResult');
-    if (ta) {
-        ta.value += map[sender] || '';
-        ta.scrollTop = ta.scrollHeight;
-    }
+    const ts = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    historyFor(currentAction).push({ sender, message, emoji, timestamp: ts });
+    if (window.priceCheckContainer) renderChat();
     if (sender === 'user' && document.getElementById('clearTextCheckbox')?.checked) {
         const ms = parseInt(document.getElementById('timeoutSlider')?.value || 500, 10);
         setTimeout(() => { const inp = document.getElementById('priceCheckInput'); if (inp) inp.value = ''; }, ms);
     }
 }
 
+// ─── Рендер ленты активной вкладки ────────────────────────────────────────────
+function renderChat() {
+    const log = document.getElementById('mcChatLog');
+    if (!log) return;
+    log.replaceChildren();
+    const entries = chatHistoryByAction[currentAction] || [];
+    entries.forEach(entry => log.appendChild(renderMessageBubble(entry)));
+    log.scrollTop = log.scrollHeight;
+}
+
+function renderMessageBubble(entry) {
+    const bubble = document.createElement('div');
+    bubble.className = `mc-msg mc-msg-${entry.sender}`;
+
+    if (entry.sender === 'system') {
+        bubble.textContent = `${entry.emoji ? entry.emoji + ' ' : ''}${entry.message}`;
+        return bubble;
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'mc-msg-meta';
+    meta.textContent = `${entry.emoji ? entry.emoji + ' ' : ''}${entry.timestamp}`;
+    bubble.appendChild(meta);
+
+    const body = document.createElement('div');
+    body.className = 'mc-msg-body';
+    body.textContent = entry.message;      // textContent — защита от HTML
+    bubble.appendChild(body);
+
+    if (entry.sender === 'bot') {
+        const copy = document.createElement('button');
+        copy.type = 'button';
+        copy.className = 'mc-copy-btn';
+        copy.dataset.copy = entry.message; // текст для копирования
+        copy.textContent = '📋 Копировать';
+        bubble.appendChild(copy);
+    }
+    return bubble;
+}
+
+// Делегированный клик по кнопкам «Копировать» в ленте.
+function handleChatLogClick(event) {
+    const btn = event.target.closest('.mc-copy-btn');
+    if (!btn) return;
+    copyHatikoText(btn.dataset.copy || '');
+    const original = btn.textContent;
+    btn.textContent = '✅ Скопировано';
+    btn.classList.add('mc-copy-done');
+    setTimeout(() => {
+        btn.textContent = original;
+        btn.classList.remove('mc-copy-done');
+    }, 1200);
+}
+
 function clearChat() {
-    const ta = document.getElementById('priceCheckResult');
-    if (ta) ta.value = '';
-    chatHistory = [];
-    addToChatHistory('system', 'Чат очищен', '🧹');
+    // Очищает только историю активной вкладки
+    if (currentAction) delete chatHistoryByAction[currentAction];
+    renderChat();
 }
 
 function clearResultForNewRequest() {
-    const ta = document.getElementById('priceCheckResult');
-    if (ta) ta.value = '';
     document.getElementById('hatikoLinksPanel')?.replaceChildren();
     document.getElementById('hatikoLinksPanel')?.style.setProperty('display', 'none');
     document.getElementById('hatikoReopenPickerButton')?.style.setProperty('display', 'none');
@@ -835,28 +928,12 @@ function calculateSimple() {
     }
 }
 
-function copyText() {
-    for (let i = chatHistory.length - 1; i >= 0; i--) {
-        const e = chatHistory[i];
-        if (e.sender === 'bot' || e.sender === 'system') {
-            const ta = document.createElement('textarea');
-            ta.value = e.message;
-            document.body.appendChild(ta);
-            ta.select();
-            document.execCommand('copy');
-            document.body.removeChild(ta);
-            addToChatHistory('system', 'Последний ответ скопирован', '📋');
-            return;
-        }
-    }
-    addToChatHistory('system', 'Нет ответов для копирования', '⚠️');
-}
-
 /* ===== 06-schedule.js ===== */
 
 // ─── Расписание ───────────────────────────────────────────────────────────────
-function fetchWhoWorksToday()    { addToChatHistory('user', 'Кто работает сегодня?', '👨‍💼 Сегодня'); fetchWhoWorks('today'); }
-function fetchWhoWorksTomorrow() { addToChatHistory('user', 'Кто работает завтра?',  '👨‍💼 Завтра');  fetchWhoWorks('tomorrow'); }
+// Вкладки «Сегодня»/«Завтра» открывают модальное окно с таблицей «Кто/Где».
+function fetchWhoWorksToday()    { fetchWhoWorks('today'); }
+function fetchWhoWorksTomorrow() { fetchWhoWorks('tomorrow'); }
 
 function fetchWhoWorks(day) {
     const url     = `https://docs.google.com/spreadsheets/d/13KUmHtRXYbXjBE7KQ_4MFQ5VsgUYqu2heURY1y2NwiE/edit`;
@@ -874,7 +951,7 @@ function loadTableWithReplacements(day, url, replacements) {
         onload(response) {
             const regex = /🎯РАБОЧИЙ_ГРАФИК_ДАННЫЕ🎯([\s\S]*?)🎯/i;
             const match = response.responseText.match(regex);
-            if (!match?.[1]) { addToChatHistory('bot', 'Не удалось найти данные в таблице', '👨‍💼'); return; }
+            if (!match?.[1]) { openScheduleTableWindow(day, null, 'Не удалось найти данные в таблице'); return; }
 
             const tmp = document.createElement('div');
             tmp.innerHTML = match[1];
@@ -886,15 +963,164 @@ function loadTableWithReplacements(day, url, replacements) {
             };
             const [sm, em] = markers[day];
             const si = full.indexOf(sm), ei = full.indexOf(em);
-            if (si === -1 || ei === -1) { addToChatHistory('bot', 'Данные не найдены', '👨‍💼'); return; }
+            if (si === -1 || ei === -1) { openScheduleTableWindow(day, null, 'Данные не найдены'); return; }
 
             let text = full.substring(si, ei).replace(sm, '').replace(em, '').trim();
-            addToChatHistory('bot', formatOutputWithReplacements(text, replacements, day), '👨‍💼');
+            const parsed = parseScheduleLines(text, replacements, day);
+            const textCopy = formatOutputWithReplacements(text, replacements, day);
+            openScheduleTableWindow(day, parsed, textCopy);
         },
-        onerror(e) { addToChatHistory('bot', 'Ошибка сети: ' + e.statusText, '👨‍💼'); }
+        onerror() { openScheduleTableWindow(day, null, 'Ошибка сети при загрузке расписания'); }
     });
 }
 
+// Разбирает расписание на группы по городам. Вход — «почти одна строка» с
+// маркерами: 🏢/🏙 начинают город, 👤 — человека. Разделители строк не нужны.
+//   [{ city, rows: [{ person, store }] }]
+function parseScheduleLines(text, replacements, day) {
+    const dateMatch = text.match(/(\d{2}\.\d{2}\.\d{4})/);
+    const dateStr = dateMatch ? dateMatch[1] : '';
+    let cleaned = text.replace(dateStr, '').replace(/📅/g, '').replace(/\|/g, ' - ').trim();
+
+    const groups = [];
+    let current = null;
+
+    // Режем по маркерам, сохраняя их в начале токена
+    const tokens = cleaned.split(/(?=🏢|🏙|👤)/).map(t => t.trim()).filter(Boolean);
+
+    tokens.forEach(token => {
+        if (/^🏢|^🏙/.test(token)) {
+            const city = token.replace(/^🏢|^🏙/, '')
+                .replace(/^В городе\s*/i, '')
+                .trim() || '—';
+            current = { city, rows: [] };
+            groups.push(current);
+            return;
+        }
+        if (/^👤/.test(token)) {
+            const body = token.replace(/^👤\s*/, '');
+            const [info, value] = body.includes(' - ') ? body.split(' - ') : [body, ''];
+            // Имя и email часто склеены без пробела: «Русланmilibaev@skl4dm»
+            const person = info
+                .replace(/([а-яА-ЯЁё])([a-zA-Z@])/g, '$1 $2')
+                .replace(/\s+/g, ' ')
+                .trim();
+            let store = (value || '').trim();
+            if (store && replacements[store]) store = replacements[store];
+            if (!current) { current = { city: '—', rows: [] }; groups.push(current); }
+            current.rows.push({ person: person || '—', store: store || '—' });
+        }
+    });
+
+    return { dateStr, groups };
+}
+
+// Плавающее перетаскиваемое окно со списком «Кто/Где» (без затемнения).
+function openScheduleTableWindow(day, parsed, textCopy) {
+    closeMemchatOverlay();
+
+    const dayName = day === 'today' ? 'Сегодня' : 'Завтра';
+    const win = document.createElement('div');
+        win.className = 'mc-float-window';
+        applyFloatWindowPos(win);
+
+    // ── Заголовок (за него можно таскать) ──
+    const header = document.createElement('div');
+    header.className = 'mc-float-header';
+    const title = document.createElement('div');
+    title.className = 'mc-float-title';
+    title.textContent = `📅 ${dayName}${parsed?.dateStr ? ' — ' + parsed.dateStr : ''}`;
+    header.appendChild(title);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'mc-float-close';
+    close.textContent = '✕';
+    close.addEventListener('click', closeMemchatOverlay);
+    header.appendChild(close);
+    win.appendChild(header);
+
+    // ── Тело: список по городам или ошибка ──
+    const body = document.createElement('div');
+    body.className = 'mc-float-body';
+    if (!parsed || !parsed.groups.length) {
+        const err = document.createElement('div');
+        err.style.cssText = 'color:#991b1b;background:#fee2e2;border:1px solid #fecaca;border-radius:10px;padding:10px;font-size:12px;';
+        err.textContent = textCopy || 'Нет данных';
+        body.appendChild(err);
+    } else {
+        parsed.groups.forEach(group => {
+            const cityHeader = document.createElement('div');
+            cityHeader.className = 'mc-sched-city';
+            cityHeader.textContent = `🏙 ${group.city}`;
+            body.appendChild(cityHeader);
+            group.rows.forEach(row => {
+                const line = document.createElement('div');
+                line.className = 'mc-sched-row';
+                line.textContent = `👤 ${row.person} — ${row.store}`;
+                body.appendChild(line);
+            });
+        });
+    }
+    win.appendChild(body);
+
+    // ── Подвал: копировать текст ──
+    const footer = document.createElement('div');
+    footer.className = 'mc-float-footer';
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'mc-btn mc-btn-blue';
+    copyBtn.textContent = '📋 Копировать текст';
+    copyBtn.addEventListener('click', () => {
+        copyHatikoText(textCopy || '');
+        copyBtn.textContent = '✅ Скопировано';
+        setTimeout(() => { copyBtn.textContent = '📋 Копировать текст'; }, 1200);
+    });
+    footer.appendChild(copyBtn);
+    win.appendChild(footer);
+
+    document.body.appendChild(win);
+    makeMovable(win, header);
+}
+
+function closeMemchatOverlay() {
+    document.querySelectorAll('.mc-overlay, .mc-float-window').forEach(el => el.remove());
+}
+
+// Применяет сохранённую позицию к плавающему окну (если есть).
+function applyFloatWindowPos(el) {
+    const pos = loadFloatWindowPos();
+    if (!pos) return;
+    el.style.left = `${pos.left}px`;
+    el.style.top = `${pos.top}px`;
+    el.style.right = 'auto';
+}
+
+// Делает окно перетаскиваемым за переданный элемент-заголовок.
+// Позиция плавающих окон сохраняется в localStorage.
+function makeMovable(el, handle) {
+    handle.addEventListener('mousedown', e => {
+        if (e.target.closest('button, input, select, a')) return;
+        const rect = el.getBoundingClientRect();
+        const offsetX = e.clientX - rect.left;
+        const offsetY = e.clientY - rect.top;
+        const onMove = ev => {
+            el.style.left = `${Math.max(0, ev.clientX - offsetX)}px`;
+            el.style.top = `${Math.max(0, ev.clientY - offsetY)}px`;
+            el.style.right = 'auto';
+        };
+        const onUp = () => {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+            if (el.classList.contains('mc-float-window')) {
+                saveFloatWindowPos(el.style.left, el.style.top);
+            }
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    });
+}
+
+// Текстовый формат (для «Копировать текст» и совместимости со старым выводом).
 function formatOutputWithReplacements(text, replacements, day) {
     const dateMatch = text.match(/(\d{2}\.\d{2}\.\d{4})/);
     const dateStr = dateMatch ? dateMatch[1] : '';
@@ -1127,28 +1353,34 @@ function _appendRulesPanelFooter(panel, type) {
 /* ===== 08-clear-and-actions.js ===== */
 
 // ─── Очистка текста ───────────────────────────────────────────────────────────
+// Вызывается при каждом открытии окна настроек (элементы создаются заново),
+// поэтому document-слушатель вешается один раз через флаг.
 function setupGlobalClearTextFunctionality() {
     const saved = localStorage.getItem('clearTextEnabled');
-    if (saved !== null) {
-        clearTextEnabled = saved === 'true';
-        const cb = document.getElementById('clearTextCheckbox');
-        if (cb) cb.checked = clearTextEnabled;
+    if (saved !== null) clearTextEnabled = saved === 'true';
+    const cb = document.getElementById('clearTextCheckbox');
+    if (cb) {
+        cb.checked = clearTextEnabled;
+        cb.addEventListener('change', function () {
+            clearTextEnabled = this.checked;
+            localStorage.setItem('clearTextEnabled', clearTextEnabled);
+            updateClearTextButton();
+        });
     }
-    document.getElementById('clearTextCheckbox')?.addEventListener('change', function () {
-        clearTextEnabled = this.checked;
-        localStorage.setItem('clearTextEnabled', clearTextEnabled);
-        updateClearTextButton();
-    });
-    document.addEventListener('keypress', e => {
-        if (e.key === 'Enter' && clearTextEnabled && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
-            const ms = parseInt(document.getElementById('timeoutSlider')?.value || 500, 10);
-            setTimeout(() => { e.target.value = ''; }, ms);
-        }
-    });
+    if (!globalClearKeypressBound) {
+        globalClearKeypressBound = true;
+        document.addEventListener('keypress', e => {
+            if (e.key === 'Enter' && clearTextEnabled && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
+                const ms = parseInt(document.getElementById('timeoutSlider')?.value || 500, 10);
+                setTimeout(() => { e.target.value = ''; }, ms);
+            }
+        });
+    }
     updateClearTextButton();
 }
 
 function updateClearTextButton() {
+    // Кнопка-индикатор убрана в 6.0.0 (очистка текста — чекбокс во вкладке «Настройки»).
     const btn = document.getElementById('clearTextButton');
     if (!btn) return;
     if (clearTextEnabled) {
@@ -1164,6 +1396,7 @@ function updateClearTextButton() {
 
 // ─── Диспетчер действий ───────────────────────────────────────────────────────
 function executeCurrentAction() {
+    // Enter работает только на режимных вкладках; для действий и «Настроек» — no-op.
     debugLog('action', currentAction);
     switch (currentAction) {
         case 'checkHatiko':          checkHatiko();              break;
@@ -1172,7 +1405,7 @@ function executeCurrentAction() {
         case 'calculator_reverse':   calculateReverse();         break;
         case 'calculator_discount':  applyDiscountOrMarkup();    break;
         case 'calculator_simple':    calculateSimple();          break;
-        default: addToChatHistory('system', 'Выберите действие', '⚠️');
+        default: /* no-op */;
     }
 }
 
@@ -1247,15 +1480,6 @@ function createPriceCheckWindow() {
             #priceCheckContainer .mc-panel input[type="text"],
             #priceCheckContainer .mc-panel textarea,
             #priceCheckContainer .mc-panel select { background:#ffffff !important; color:#334155 !important; border-color:#cbd5e1 !important; }
-            #priceCheckResult {
-                flex: 1 1 auto; width: 100%; min-height: 60px; resize: vertical;
-                background: #ffffff; border: 1.5px solid #e5e7eb;
-                border-radius: 10px; color: #64748b; font-size: 11.5px;
-                padding: 10px 12px; box-sizing: border-box; line-height: 1.65;
-                font-family: 'Cascadia Code','Fira Code','Consolas',monospace;
-                outline: none; transition: border-color .2s;
-            }
-            #priceCheckResult:focus { border-color: #cbd5e1; color: #475569; }
             #hatikoRequestStatus { display:none; color:#475569; font-size:10px; min-height:14px; padding:5px 8px; border-radius:7px; background:#f1f5f9; border:1px solid #e2e8f0; }
             #hatikoRequestStatus[data-state] { display:block; }
             #hatikoRequestStatus[data-state="busy"] { color:#1d4ed8; background:#dbeafe; }
@@ -1268,7 +1492,162 @@ function createPriceCheckWindow() {
                 border-radius:10px; padding:8px 10px; font-size:11px;
             }
             .mc-links-panel a { display:block; color:#2563eb; margin:4px 0; word-break:break-all; }
-        `;
+
+                        /* ── Вкладки ── */
+                        #mcTabs {
+                            display: flex; gap: 4px; overflow-x: auto; flex-wrap: nowrap;
+                            padding-bottom: 2px;
+                        }
+                        #mcTabs::-webkit-scrollbar { height: 3px; }
+                        .mc-tab {
+                            flex: 0 0 auto;
+                            padding: 5px 8px; border: 1px solid #e2e8f0; border-radius: 8px;
+                            background: #f8fafc; color: #475569; font-size: 11px; font-weight: 600;
+                            cursor: pointer; transition: all .15s ease; white-space: nowrap;
+                        }
+                        .mc-tab:hover { border-color: #6366f1; color: #4f46e5; background: #eef2ff; }
+                        .mc-tab-active {
+                            background: linear-gradient(135deg,#6366f1,#8b5cf6) !important;
+                            border-color: transparent !important; color: #fff !important;
+                            box-shadow: 0 2px 8px #6366f138;
+                        }
+
+                        /* ── Ленta сообщений (вместo textarea) ── */
+                        #mcChatLog {
+                            flex: 1 1 auto; width: 100%; min-height: 80px;
+                                            display: flex; flex-direction: column; gap: 6px;
+                            overflow-y: auto; padding: 6px; box-sizing: border-box;
+                            background: #ffffff; border: 1.5px solid #e5e7eb; border-radius: 10px;
+                        }
+                        #mcChatLog:empty::after {
+                            content: 'Запросы появятся здесь…';
+                            display: block; margin: auto; color: #94a3b8; font-size: 11px;
+                            font-style: italic; opacity: .8;
+                        }
+                        .mc-msg {
+                            max-width: 92%; padding: 5px 9px; border-radius: 10px;
+                            font-size: 11.5px; line-height: 1.55; word-break: break-word;
+                            box-sizing: border-box;
+                        }
+                        .mc-msg-meta {
+                            font-size: 8.5px; opacity: .65; letter-spacing: .3px;
+                            margin-bottom: 2px; text-transform: uppercase;
+                        }
+                        .mc-msg-body { white-space: pre-wrap; word-break: break-word; }
+                        .mc-msg-user {
+                            align-self: flex-end; background: linear-gradient(135deg,#6366f1,#7c3aed);
+                            color: #fff; border-bottom-right-radius: 3px;
+                        }
+                        .mc-msg-user .mc-msg-meta { color: #e0e7ff; }
+                        .mc-msg-bot {
+                            align-self: flex-start; background: #f1f5f9; color: #1f2937;
+                            border: 1px solid #e5e7eb; border-bottom-left-radius: 3px;
+                        }
+                        .mc-msg-bot .mc-msg-meta { color: #6366f1; }
+                        .mc-msg-system {
+                            align-self: center; background: #fef9c3; color: #854d0e;
+                            border: 1px solid #fde68a; font-size: 10.5px; text-align: center;
+                        }
+                        .mc-copy-btn {
+                                        display: inline-block; margin-top: 5px; padding: 2px 8px;
+                                        border: 1px solid #c7d2fe; border-radius: 6px;
+                                        background: #ffffff; color: #4f46e5; font-size: 9.5px; font-weight: 600;
+                                        cursor: pointer; transition: all .15s;
+                                    }
+                                    .mc-copy-btn:hover { background: #eef2ff; border-color: #818cf8; }
+                                    .mc-copy-done { background: #dcfce7 !important; border-color: #86efac !important; color: #166534 !important; }
+
+                        /* ── Нижняя панель ── */
+                        #mcBottomBar {
+                            flex: 0 0 auto; display: flex; justify-content: flex-end; gap: 6px;
+                        }
+                        .mc-btn-clear {
+                            padding: 5px 12px; border: 1px solid #fca5a5; border-radius: 8px;
+                            background: #ffffff; color: #dc2626; font-size: 11px; font-weight: 600;
+                            cursor: pointer; transition: all .15s;
+                        }
+                        .mc-btn-clear:hover { background: #fef2f2; border-color: #ef4444; }
+                        .mc-action-btn {
+                            padding: 4px 9px; border: 1px solid #e2e8f0; border-radius: 8px;
+                            background: #f8fafc; font-size: 13px; line-height: 1; cursor: pointer;
+                            transition: all .15s;
+                        }
+                        .mc-action-btn:hover { background: #eef2ff; border-color: #818cf8; transform: translateY(-1px); }
+
+                        /* ── Статус-бар: подсказки при наведении ── */
+                        .mc-status-bar {
+                            flex: 1 1 auto; min-width: 0;
+                            font-size: 10px; color: #64748b; line-height: 1.3;
+                            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                            user-select: none;
+                        }
+
+                        /* ── Плавающие окна (расписание, Хакер) — без затемнения ── */
+                        .mc-float-window {
+                            position: fixed; top: 90px; right: 40px; width: 380px;
+                            max-height: 70vh; background: #ffffff; border: 1px solid #dbe3ee;
+                            border-radius: 14px; box-shadow: 0 14px 40px rgba(15,23,42,.18);
+                            display: flex; flex-direction: column; gap: 8px; padding: 12px;
+                            z-index: 100000; box-sizing: border-box;
+                            color: #1f2937; font-size: 12.5px;
+                        }
+                        .mc-float-header {
+                            display: flex; align-items: center; justify-content: space-between;
+                            cursor: move; user-select: none; padding-bottom: 6px;
+                            border-bottom: 1px solid #e2e8f0;
+                        }
+                        .mc-float-title { font-size: 13.5px; font-weight: 700; color: #111827; }
+                        .mc-float-close {
+                            border: 0; border-radius: 7px; padding: 4px 8px;
+                            background: #f1f5f9; color: #64748b; cursor: pointer; font-size: 12px;
+                        }
+                        .mc-float-close:hover { background: #fee2e2; color: #dc2626; }
+                        .mc-float-body { flex: 1 1 auto; overflow-y: auto; }
+                        .mc-float-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
+                        .mc-sched-city {
+                            font-size: 11px; font-weight: 700; color: #4f46e5;
+                            background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 8px;
+                            padding: 4px 9px; margin-top: 6px;
+                        }
+                        .mc-sched-row {
+                            font-size: 11.5px; padding: 4px 9px; margin-top: 4px;
+                            border: 1px solid #e5e7eb; border-radius: 7px; background: #ffffff;
+                            color: #1f2937; white-space: pre-wrap; word-break: break-word;
+                        }
+
+                        /* ── Оверлеи ── */
+                        .mc-overlay {
+                            position: fixed; inset: 0; z-index: 100000;
+                            display: flex; align-items: center; justify-content: center;
+                            padding: 20px; background: rgba(2,6,23,.72);
+                        }
+                        .mc-overlay-modal {
+                            width: min(620px, calc(100vw - 40px)); max-height: 80vh; overflow: auto;
+                            padding: 16px; background: #ffffff; border: 1px solid #dbe3ee;
+                            border-radius: 16px; box-shadow: 0 18px 60px rgba(0,0,0,.6);
+                            color: #1f2937;
+                        }
+                        .mc-overlay-header {
+                                        display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;
+                                        font-size: 15px; color: #111827;
+                                    }
+                                    .mc-overlay-close {
+                                        border: 0; border-radius: 7px; padding: 6px 9px; background: #f1f5f9; color: #475569; cursor: pointer;
+                                    }
+                                    .mc-overlay-close:hover { background: #fee2e2; color: #dc2626; }
+                                    .mc-overlay-footer { display: flex; justify-content: flex-end; margin-top: 12px; }
+                                    .mc-overlay-error { color: #991b1b; background: #fee2e2; border: 1px solid #fecaca; border-radius: 10px; padding: 10px; font-size: 12px; }
+                        .mc-sched-city {
+                            font-size: 11px; font-weight: 700; background: #f8fafc; border: 1px solid #e5e7eb;
+                            border-radius: 8px 8px 0 0; padding: 5px 10px; margin-top: 8px;
+                        }
+                        .mc-sched-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+                        .mc-sched-table th, .mc-sched-table td {
+                            text-align: left; padding: 5px 10px; border: 1px solid #e5e7eb;
+                        }
+                        .mc-sched-table th { background: #f1f5f9; color: #475569; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+                        .mc-sched-table tbody tr:nth-child(odd) { background: #fafbff; }
+                    `;
         document.head.appendChild(style);
 
         const container = document.createElement('div');
@@ -1301,7 +1680,8 @@ function createPriceCheckWindow() {
                     ">🐱</div>
                     <div>
                         <div style="font-size:14px;font-weight:700;color:#111827;line-height:1.2;">Мемный чат</div>
-                        <div id="memchatVersion" style="font-size:9.5px;color:#64748b;letter-spacing:.6px;margin-top:1px;"></div>
+                        <div id="memchatTabTitle" style="font-size:10px;font-weight:600;color:#4f46e5;letter-spacing:.3px;margin-top:1px;">🐶 Hatiko</div>
+                        <div id="memchatVersion" style="font-size:8.5px;color:#94a3b8;letter-spacing:.5px;margin-top:1px;"></div>
                     </div>
                 </div>
                 <button id="priceCheckCloseButton" style="
@@ -1310,6 +1690,16 @@ function createPriceCheckWindow() {
                     cursor:pointer;transition:all .18s;
                     display:flex;align-items:center;justify-content:center;flex-shrink:0;
                 ">✕</button>
+            </div>
+
+            <!-- ── Вкладки (эмодзи; полное название — в заголовке) ── -->
+            <div id="mcTabs" role="tablist">
+                <button class="mc-tab" data-tab="checkHatiko" data-tip="🐶 Hatiko — поиск и цены">🐶</button>
+                <button class="mc-tab" data-tab="checkHatikoBonuses" data-tip="🎁 Бонусы — бонусы клиента">🎁</button>
+                <button class="mc-tab" data-tab="calculator" data-tip="🧮 Калькулятор — расчёт кредита">🧮</button>
+                <button class="mc-tab" data-tab="calculator_reverse" data-tip="🔄 Реверс — обратный расчёт">🔄</button>
+                <button class="mc-tab" data-tab="calculator_discount" data-tip="🎉 Скидка — скидка и наценка">🎉</button>
+                <button class="mc-tab" data-tab="calculator_simple" data-tip="∑ Простой — простое выражение">∑</button>
             </div>
 
             <!-- ── Поле ввода ── -->
@@ -1322,104 +1712,29 @@ function createPriceCheckWindow() {
             </div>
 
             <!-- ── Лог / результат ── -->
-            <div id="mcResultRegion" style="flex:1 1 auto;display:flex;flex-direction:column;gap:8px;min-height:80px;">
-                <textarea id="priceCheckResult" readonly spellcheck="false"></textarea>
-                <div id="hatikoRequestStatus" role="status" aria-live="polite"></div>
-                <button id="hatikoReopenPickerButton" type="button" style="display:none;padding:5px 8px;border:1px solid #475569;border-radius:7px;background:#fff;color:#475569;cursor:pointer;">↶ Выбрать другой товар</button>
-                <div id="hatikoLinksPanel" class="mc-links-panel"></div>
-            </div>
+                        <div id="mcResultRegion" style="flex:1 1 auto;display:flex;flex-direction:column;gap:8px;min-height:80px;">
+                            <div id="mcChatLog" role="log"></div>
+                            <div id="hatikoRequestStatus" role="status" aria-live="polite"></div>
+                            <button id="hatikoReopenPickerButton" type="button" style="display:none;padding:5px 8px;border:1px solid #475569;border-radius:7px;background:#fff;color:#475569;cursor:pointer;">↶ Выбрать другой товар</button>
+                            <div id="hatikoLinksPanel" class="mc-links-panel"></div>
+                        </div>
 
-            <!-- ── Нижняя панель действий ── -->
-            <div id="mcBottomRegion" style="flex:0 1 auto;display:flex;flex-direction:column;gap:8px;overflow-y:auto;">
-
-            <!-- ── Группа 1: расчётные ── -->
-            <div>
-                <div class="mc-section-label">Поиск и расчёт</div>
-                <div style="display:flex;flex-wrap:wrap;gap:5px;">
-                    <button class="mc-btn mc-btn-green"  data-action="checkHatiko">🐶 Hatiko</button>
-                    <button class="mc-btn mc-btn-green"  data-action="checkHatikoBonuses">🎁 Бонусы</button>
-                    <button class="mc-btn mc-btn-indigo" data-action="calculator">🧮 Калькулятор</button>
-                    <button class="mc-btn mc-btn-purple" data-action="calculator_reverse">🔄 Реверс</button>
-                    <button class="mc-btn mc-btn-orange" data-action="calculator_discount">🎉 Скидка/+</button>
-                    <button class="mc-btn mc-btn-teal"   data-action="calculator_simple">∑ Простой</button>
-                </div>
-            </div>
-
-            <!-- ── Группа 2: быстрые ── -->
-            <div>
-                <div class="mc-section-label">Быстрые действия</div>
-                <div style="display:flex;flex-wrap:wrap;gap:5px;">
-                    <button id="whoWorksTodayButton"    class="mc-btn mc-btn-blue">👨‍💼 Сегодня</button>
-                    <button id="whoWorksTomorrowButton" class="mc-btn mc-btn-blue">📅 Завтра</button>
-                    <button id="copyButton"             class="mc-btn mc-btn-blue">📋 Копировать</button>
-                    <button id="clearChatButton"        class="mc-btn mc-btn-blue">🗑️ Чат</button>
-                </div>
-            </div>
-
-            <!-- ── Группа 3: настройки ── -->
-            <div>
-                <div class="mc-section-label">Настройки</div>
-                <div style="display:flex;flex-wrap:wrap;gap:5px;">
-                    <button id="clearTextButton"    class="mc-btn mc-btn-orange">🧹 Выкл</button>
-                    <button id="calcSettingsBtn"    class="mc-btn mc-btn-slate">⚙️ Правила 🧮</button>
-                    <button id="scheduleSettingsBtn" class="mc-btn mc-btn-slate">⚙️ Замены 📅</button>
-                </div>
-            </div>
-
-            <!-- ── Панель правил калькулятора ── -->
-            <div id="calcSettingsPanel" class="mc-panel" style="display:none;">
-                <div class="mc-panel-title">⚙️ Правила калькулятора
-                    <span style="font-weight:400;color:#334155;text-transform:none;letter-spacing:0;margin-left:6px;">
-                        round(сумма × % ÷ 100 ÷ округл.) × округл. + доп.
-                    </span>
-                </div>
-                <div id="calcRulesPanel"></div>
-            </div>
-
-            <!-- ── Панель замен расписания ── -->
-            <div id="scheduleSettingsPanel" class="mc-panel" style="display:none;">
-                <div class="mc-panel-title">⚙️ Замены для расписания</div>
-                <div id="scheduleRulesPanel"></div>
-            </div>
-
-            <!-- ── Панель очистки текста ── -->
-            <div id="settingsPanel" class="mc-panel" style="display:none;max-height:none;">
-                <div class="mc-panel-title">⚙️ Настройки очистки</div>
-                <label style="display:flex;align-items:center;gap:8px;color:#475569;font-size:12px;margin-bottom:10px;cursor:pointer;">
-                    <input type="checkbox" id="clearTextCheckbox" style="accent-color:#6366f1;width:14px;height:14px;">
-                    Глобальная очистка текста после Enter
-                </label>
-                <label style="display:block;color:#475569;font-size:12px;">
-                    Задержка: <span id="timeoutValue" style="color:#6366f1;font-weight:700;">500</span> мс
-                    <input type="range" id="timeoutSlider" min="1" max="2000" value="500"
-                        style="width:100%;margin-top:5px;accent-color:#6366f1;display:block;">
-                </label>
-                <label style="display:flex;align-items:center;gap:8px;color:#475569;font-size:12px;margin-top:10px;cursor:pointer;">
-                    <input type="checkbox" id="showHatikoLinksCheckbox" style="accent-color:#6366f1;width:14px;height:14px;">
-                    Показывать ссылки Hatiko
-                </label>
-                <label style="display:block;color:#475569;font-size:12px;margin-top:10px;">
-                    Поиск цифровых запросов:
-                    <select id="hatikoSearchMode" style="display:block;width:100%;margin-top:5px;padding:5px;background:#fff;border:1px solid #cbd5e1;border-radius:6px;color:#334155;">
-                        <option value="auto">Сначала Panel, затем сайт</option>
-                        <option value="panel">Только Panel</option>
-                        <option value="hatiko">Только сайт Hatiko</option>
-                    </select>
-                </label>
-            </div>
-            </div>
-        `;
+            <!-- ── Нижняя панель: статус + действия + настройки + очистка ── -->
+                        <div id="mcBottomBar" style="flex:0 0 auto;display:flex;justify-content:flex-end;gap:6px;align-items:center;">
+                            <span id="mcStatusBar" class="mc-status-bar">Наведите на кнопку…</span>
+                            <button id="mcActionToday" class="mc-action-btn" type="button" data-tip="👨‍💼 Кто работает сегодня">👨‍💼</button>
+                            <button id="mcActionTomorrow" class="mc-action-btn" type="button" data-tip="📅 Кто работает завтра">📅</button>
+                            <button id="mcActionHacker" class="mc-action-btn" type="button" data-tip="🐱‍👨‍💻 ХатикоХакер — будущие задачи">🐱‍👨‍💻</button>
+                            <button id="mcActionSettings" class="mc-action-btn" type="button" data-tip="⚙️ Настройки">⚙️</button>
+                            <button id="mcClearChatButton" class="mc-btn-clear" type="button" data-tip="🗑 Очистить историю этой вкладки">🗑</button>
+                        </div>
+                    `;
 
         document.body.appendChild(container);
         window.priceCheckContainer = container;
         document.getElementById('memchatVersion').textContent = `v${MEMCHAT_VERSION}${typeof MEMCHAT_BUILD !== 'undefined' ? `-${MEMCHAT_BUILD}` : ''}`;
         setupEventListeners();
-        setupGlobalClearTextFunctionality();
-        setupHatikoLinksSetting();
-        setupHatikoSearchModeSetting();
         document.getElementById('hatikoReopenPickerButton').addEventListener('click', reopenHatikoProductPicker);
-        buildCalcRulesPanel();
-        buildSchedulePanel();
     }
 
     window.priceCheckContainer.style.display = 'flex';
@@ -1598,89 +1913,255 @@ function openHatikoProductPicker(results) {
     document.body.appendChild(overlay);
 }
 
+// ─── Статус-бар (подсказки при наведении) ────────────────────────────────────
+function setStatusText(message) {
+    const bar = document.getElementById('mcStatusBar');
+    if (bar) bar.textContent = message;
+}
+
+// ─── Заглушка «ХатикоХакер» ───────────────────────────────────────────────────
+function openHackerStubWindow() {
+    closeMemchatOverlay();
+
+    const win = document.createElement('div');
+    win.className = 'mc-float-window';
+    applyFloatWindowPos(win);
+
+    const header = document.createElement('div');
+    header.className = 'mc-float-header';
+    const title = document.createElement('div');
+    title.className = 'mc-float-title';
+    title.textContent = '🐱👨‍💻 ХатикоХакер';
+    header.appendChild(title);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'mc-float-close';
+    close.textContent = '✕';
+    close.addEventListener('click', closeMemchatOverlay);
+    header.appendChild(close);
+    win.appendChild(header);
+
+    const body = document.createElement('div');
+    body.className = 'mc-float-body';
+
+    const stub = document.createElement('div');
+    stub.style.textAlign = 'center';
+    stub.style.padding = '18px 0 6px';
+    stub.innerHTML = '<div style="font-size:40px;">🔧</div>'
+        + '<p style="margin:10px 0 6px;font-size:14px;font-weight:700;color:#111827;">Заглушка для будущих задач</p>'
+        + '<p style="margin:0;font-size:12px;color:#64748b;">Здесь появится автоматизация «Хатико-Техники»: реверс-инжиниринг, серверные интеграции и всё, что мы придумаем дальше.</p>';
+    body.appendChild(stub);
+
+    win.appendChild(body);
+    document.body.appendChild(win);
+    makeMovable(win, header);
+}
+
+// ─── Окно «Настройки» ─────────────────────────────────────────────────────────
+// Отдельное плавающее перетаскиваемое окно (позиция сохраняется).
+function openSettingsWindow() {
+    closeMemchatOverlay();
+
+    const win = document.createElement('div');
+    win.className = 'mc-float-window';
+    applyFloatWindowPos(win);
+
+    const header = document.createElement('div');
+    header.className = 'mc-float-header';
+    const title = document.createElement('div');
+    title.className = 'mc-float-title';
+    title.textContent = '⚙️ Настройки';
+    header.appendChild(title);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'mc-float-close';
+    close.textContent = '✕';
+    close.addEventListener('click', closeMemchatOverlay);
+    header.appendChild(close);
+    win.appendChild(header);
+
+    const body = document.createElement('div');
+    body.className = 'mc-float-body';
+    body.innerHTML = `
+        <div class="mc-section-label">Очистка текста</div>
+        <label style="display:flex;align-items:center;gap:8px;color:#475569;font-size:12px;margin-bottom:10px;cursor:pointer;">
+            <input type="checkbox" id="clearTextCheckbox" style="accent-color:#6366f1;width:14px;height:14px;">
+            Глобальная очистка текста после Enter
+        </label>
+        <label style="display:block;color:#475569;font-size:12px;">
+            Задержка: <span id="timeoutValue" style="color:#6366f1;font-weight:700;">500</span> мс
+            <input type="range" id="timeoutSlider" min="1" max="2000" value="500"
+                style="width:100%;margin-top:5px;accent-color:#6366f1;display:block;">
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;color:#475569;font-size:12px;margin-top:10px;cursor:pointer;">
+            <input type="checkbox" id="showHatikoLinksCheckbox" style="accent-color:#6366f1;width:14px;height:14px;">
+            Показывать ссылки Hatiko
+        </label>
+        <label style="display:block;color:#475569;font-size:12px;margin-top:10px;">
+            Поиск цифровых запросов:
+            <select id="hatikoSearchMode" style="display:block;width:100%;margin-top:5px;padding:5px;background:#fff;border:1px solid #cbd5e1;border-radius:6px;color:#334155;">
+                <option value="auto">Сначала Panel, затем сайт</option>
+                <option value="panel">Только Panel</option>
+                <option value="hatiko">Только сайт Hatiko</option>
+            </select>
+        </label>
+
+        <div style="height:8px;"></div>
+        <button id="calcSettingsBtn" class="mc-btn mc-btn-slate" style="width:100%;">⚙️ Правила 🧮</button>
+        <div id="calcSettingsPanel" class="mc-panel" style="display:none;max-height:none;">
+            <div class="mc-panel-title">⚙️ Правила калькулятора
+                <span style="font-weight:400;color:#334155;text-transform:none;letter-spacing:0;margin-left:6px;">
+                    round(сумма × % ÷ 100 ÷ округл.) × округл. + доп.
+                </span>
+            </div>
+            <div id="calcRulesPanel"></div>
+        </div>
+
+        <div style="height:8px;"></div>
+        <button id="scheduleSettingsBtn" class="mc-btn mc-btn-slate" style="width:100%;">⚙️ Замены 📅</button>
+        <div id="scheduleSettingsPanel" class="mc-panel" style="display:none;max-height:none;">
+            <div class="mc-panel-title">⚙️ Замены для расписания</div>
+            <div id="scheduleRulesPanel"></div>
+        </div>
+
+        <div style="height:8px;"></div>
+        <button id="resetFloatPosBtn" class="mc-btn mc-btn-orange" style="width:100%;" data-tip="↺ Вернуть окна в позицию по умолчанию">↺ Сбросить положение окон</button>
+    `;
+    win.appendChild(body);
+
+    // Сначала в DOM — иначе getElementById не найдёт элементы окна.
+    document.body.appendChild(win);
+
+    // Привязки: setup-функции синхронизируют состояние, документ-слушатель вешается один раз.
+    setupGlobalClearTextFunctionality();
+    setupHatikoLinksSetting();
+    setupHatikoSearchModeSetting();
+    document.getElementById('timeoutSlider').addEventListener('input', e => {
+        document.getElementById('timeoutValue').textContent = e.target.value;
+    });
+    document.getElementById('calcSettingsBtn').addEventListener('click', () => {
+        const panel = document.getElementById('calcSettingsPanel');
+        const wasHidden = panel.style.display === 'none';
+        togglePanel('calcSettingsPanel');
+        if (wasHidden) buildCalcRulesPanel();
+    });
+    document.getElementById('scheduleSettingsBtn').addEventListener('click', () => {
+        const panel = document.getElementById('scheduleSettingsPanel');
+        const wasHidden = panel.style.display === 'none';
+        togglePanel('scheduleSettingsPanel');
+        if (wasHidden) buildSchedulePanel();
+    });
+    document.getElementById('resetFloatPosBtn').addEventListener('click', () => {
+        resetFloatWindowPos();
+        closeMemchatOverlay();
+        setStatusText('✅ Положение окон сброшено');
+    });
+    buildCalcRulesPanel();
+    buildSchedulePanel();
+
+    makeMovable(win, header);
+}
+
 /* ===== 10-events-and-init.js ===== */
 
-// ─── Обработчики событий ──────────────────────────────────────────────────────
+// ─── Обработчики событий ─────────────────────────────────────────────────────
+const TAB_LABELS = {
+    checkHatiko: '🐶 Hatiko',
+    checkHatikoBonuses: '🎁 Бонусы',
+    calculator: '🧮 Калькулятор',
+    calculator_reverse: '🔄 Реверс',
+    calculator_discount: '🎉 Скидка/+',
+    calculator_simple: '∑ Простой'
+};
+
 function setupEventListeners() {
     const container = window.priceCheckContainer;
 
     // Перетаскивание
     document.getElementById('priceCheckHeader').addEventListener('mousedown', startDrag);
 
-    // Enter в поле ввода
+    // Enter в поле ввода — работает только на режимных вкладках
     document.getElementById('priceCheckInput').addEventListener('keypress', e => {
-        if (e.key === 'Enter' && currentAction) executeCurrentAction();
+        if (e.key === 'Enter' && currentAction && MODE_ACTIONS.includes(currentAction)) {
+            executeCurrentAction();
+        }
     });
 
     document.getElementById('priceCheckInput').addEventListener('keydown', e => {
         if (e.key === 'Escape') e.currentTarget.value = '';
     });
     document.addEventListener('keydown', e => {
-        if (e.key === 'Escape') closeHatikoProductPicker();
+        if (e.key === 'Escape') {
+            closeHatikoProductPicker();
+            closeMemchatOverlay();
+        }
     });
 
-    // Кнопки с data-action (переключаемые)
-    container.querySelectorAll('[data-action]').forEach(btn => {
-        btn.addEventListener('click', e => {
-            container.querySelectorAll('[data-action]').forEach(b => b.classList.remove('mc-btn-active'));
-            e.currentTarget.classList.add('mc-btn-active');
-            currentAction = e.currentTarget.dataset.action;
-            saveSelectedAction(currentAction);
-            debugLog('action', 'selected', currentAction);
-        });
+    // Клик по вкладке
+    container.querySelectorAll('[data-tab]').forEach(tab => {
+        tab.addEventListener('click', () => selectTab(tab.dataset.tab));
     });
 
-    // Быстрые кнопки
-    document.getElementById('whoWorksTodayButton').addEventListener('click',    fetchWhoWorksToday);
-    document.getElementById('whoWorksTomorrowButton').addEventListener('click', fetchWhoWorksTomorrow);
-    document.getElementById('copyButton').addEventListener('click',             copyText);
-    document.getElementById('clearChatButton').addEventListener('click',        clearChat);
+    // Клики по ленте (кнопки «Копировать»)
+    document.getElementById('mcChatLog').addEventListener('click', handleChatLogClick);
 
-    // Кнопка очистки → панель настроек
-    document.getElementById('clearTextButton').addEventListener('click', () => {
-        togglePanel('settingsPanel');
-    });
+    // Кнопка «Очистить» — активную вкладку
+        document.getElementById('mcClearChatButton').addEventListener('click', clearChat);
 
-    // Правила калькулятора
-    document.getElementById('calcSettingsBtn').addEventListener('click', () => {
-        const wasHidden = document.getElementById('calcSettingsPanel').style.display === 'none';
-        togglePanel('calcSettingsPanel');
-        if (wasHidden) buildCalcRulesPanel();
-    });
+        // Быстрые действия и настройки (нижняя панель)
+            document.getElementById('mcActionToday').addEventListener('click', fetchWhoWorksToday);
+            document.getElementById('mcActionTomorrow').addEventListener('click', fetchWhoWorksTomorrow);
+            document.getElementById('mcActionHacker').addEventListener('click', openHackerStubWindow);
+            document.getElementById('mcActionSettings').addEventListener('click', openSettingsWindow);
 
-    // Замены расписания
-    document.getElementById('scheduleSettingsBtn').addEventListener('click', () => {
-        const wasHidden = document.getElementById('scheduleSettingsPanel').style.display === 'none';
-        togglePanel('scheduleSettingsPanel');
-        if (wasHidden) buildSchedulePanel();
-    });
+            // Тултипы → статус-бар (текст внизу, рядом с кнопками)
+                container.addEventListener('mouseover', e => {
+                    const el = e.target.closest?.('[data-tip]');
+                    if (el) setStatusText(el.dataset.tip);
+                });
+                container.addEventListener('mouseout', e => {
+                    if (e.target.closest?.('[data-tip]')) setStatusText('Наведите на кнопку…');
+                });
 
-    // Ползунок задержки
-    document.getElementById('timeoutSlider').addEventListener('input', e => {
-        document.getElementById('timeoutValue').textContent = e.target.value;
-    });
-
-    // Закрытие
+        // Закрытие
     document.getElementById('priceCheckCloseButton').addEventListener('click', () => {
         window.priceCheckContainer.style.display = 'none';
     });
 
     // Hover эффект кнопки закрытия
     const closeBtn = document.getElementById('priceCheckCloseButton');
-    closeBtn.addEventListener('mouseenter', () => { closeBtn.style.background='#ef4444'; closeBtn.style.color='#fff'; });
-    closeBtn.addEventListener('mouseleave', () => { closeBtn.style.background='#1a2535'; closeBtn.style.color='#475569'; });
+    closeBtn.addEventListener('mouseenter', () => { closeBtn.style.background = '#ef4444'; closeBtn.style.color = '#fff'; });
+    closeBtn.addEventListener('mouseleave', () => { closeBtn.style.background = '#f1f5f9'; closeBtn.style.color = '#64748b'; });
 }
 
-// Открыть/закрыть одну панель (остальные закрываются)
+// ─── Переключение вкладок ─────────────────────────────────────────────────────
+function selectTab(tab) {
+    const tabsEl = document.getElementById('mcTabs');
+    tabsEl.querySelectorAll('[data-tab]').forEach(t => {
+        t.classList.toggle('mc-tab-active', t.dataset.tab === tab);
+    });
+
+    currentAction = tab;
+    if (MODE_ACTIONS.includes(tab)) saveSelectedAction(tab);
+    debugLog('tab', 'selected', tab);
+
+    // Название вкладки — в заголовке окна
+        const titleEl = document.getElementById('memchatTabTitle');
+        if (titleEl) titleEl.textContent = TAB_LABELS[tab] || tab;
+
+        renderChat();
+    }
+
+// Восстановить последний выбранный режим (только режимные вкладки)
 function restoreSelectedAction() {
     const action = loadSelectedAction();
-    const button = document.querySelector(`[data-action="${action}"]`)
-        || document.querySelector('[data-action="checkHatiko"]');
-    if (button) button.click();
+    const tab = document.querySelector(`[data-tab="${action}"]`)
+        || document.querySelector('[data-tab="checkHatiko"]');
+    if (tab) selectTab(tab.dataset.tab);
 }
 
 function togglePanel(id) {
-    const ids = ['settingsPanel', 'calcSettingsPanel', 'scheduleSettingsPanel'];
+    const ids = ['calcSettingsPanel', 'scheduleSettingsPanel'];
     ids.forEach(pid => {
         const el = document.getElementById(pid);
         if (!el) return;
@@ -1700,10 +2181,11 @@ function initialize() {
     startPanelBridgeListener();
     schedulePanelCsrfRefresh();
     GM_registerMenuCommand('Открыть мемный чат', createPriceCheckWindow);
-    GM_registerMenuCommand('Закрыть мемный чат', closeChatWindow);
-    GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
+        GM_registerMenuCommand('Закрыть мемный чат', closeChatWindow);
+        GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
+        GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v5.0.0 инициализирован');
+    console.log('Мемный чат v6.1.0 инициализирован');
 }
 
 // ─── Production entrypoint ───────────────────────────────────────────────────
