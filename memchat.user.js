@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      6.2.0
+// @version      6.4.0
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -25,7 +25,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '6.2.0';
+const MEMCHAT_VERSION = '6.4.0';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -106,6 +106,17 @@ let lastHatikoResults = [];
 let lastHatikoQuery = '';
 let hatikoSearchMode = 'auto';
 let activeRequestId = 0;
+
+// ─── Скрытие полей МойСклад ──────────────────────────────────────────────────
+let hiddenFields = [];        // имена полей (точный текст лейбла), прячемых на МойСклад
+let msFieldsRevealed = false; // «раскрыть всё» с плавающей кнопки 👁 (временно)
+let msFieldObserver = null;
+let msHiddenTargets = [];     // [{el, name}] — реально спрятанные сейчас элементы
+const KNOWN_MS_FIELDS = [
+    'Оплачено бонусами', 'Сумма НДС', 'Промежуточный итог', 'Общая стоимость',
+    'Объем', 'Вес', 'Канал продаж', 'Проект', 'Адрес доставки', 'Комментарий',
+    'Номер заказа на сайте', 'План. дата отгрузки', 'Договор', 'Валюта документа'
+];
 
 const DEBUG_STORAGE_KEY = 'memchat:debug';
 
@@ -233,6 +244,23 @@ function saveHatikoSearchMode(mode) {
     if (!['auto', 'panel', 'hatiko'].includes(mode)) return;
     hatikoSearchMode = mode;
     localStorage.setItem(storageKey('hatikoSearchMode_v1'), mode);
+}
+
+// ─── Скрытые поля МойСклад ───────────────────────────────────────────────────
+function loadHiddenFields() {
+    try {
+        const s = localStorage.getItem(storageKey('hiddenFields_v1'));
+        const parsed = s ? JSON.parse(s) : [];
+        hiddenFields = Array.isArray(parsed) ? parsed.filter(n => typeof n === 'string') : [];
+    } catch { hiddenFields = []; }
+}
+
+function saveHiddenFields() {
+    try {
+        localStorage.setItem(storageKey('hiddenFields_v1'), JSON.stringify(hiddenFields));
+    } catch (error) {
+        debugError('storage', 'Не удалось сохранить список скрытых полей', error);
+    }
 }
 
 // Позиция плавающих окон (расписание, настройки, Хакер) — общая и переживает сессии.
@@ -1433,6 +1461,193 @@ function _appendRulesPanelFooter(panel, type) {
     panel.appendChild(ja);
 }
 
+// ─── Скрытие полей МойСклад ──────────────────────────────────────────────────
+// Поле прячется по точному тексту лейбла. Поддерживаются три формы МойСклад:
+//  a) React-поле формы: .formItemTitle (лейбл) + следующий пустой DIV (значение)
+//  b) React-блок итогов: лейбл + значение — соседние DIV внутри [class*="totalsWrapper"]
+//  c) GWT-таблица: строка tr с ячейкой TD.legend
+// Скрытые цели запоминаются в msHiddenTargets, чтобы можно было вернуть отображение.
+
+function msFindLabelElement(name) {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while (node = walker.nextNode()) {
+        if ((node.textContent || '').trim() !== name) continue;
+        const el = node.parentElement;
+        if (!el || el.offsetHeight <= 0) continue;
+        // a) React-поле формы
+        if (el.closest('[class*="formItemTitle"]')) return el.closest('[class*="formItemTitle"]');
+        // b) React-блок итогов: лейбл — прямой ребёнок totalsWrapper
+        const wrap = el.closest('[class*="totalsWrapper"]');
+        if (wrap) {
+            let cur = el;
+            while (cur.parentElement && cur.parentElement !== wrap) cur = cur.parentElement;
+            return cur;
+        }
+        // c) GWT-таблица (ячейка-легенда)
+        const legend = el.closest('td.legend');
+        if (legend) return legend;
+        // fallback: лейбл в неизвестной структуре — берём сам элемент
+        return el;
+    }
+    return null;
+}
+
+function msCollectTargets(name) {
+    const targets = [];
+    const title = msFindLabelElement(name);
+    if (!title) return targets;
+
+    const cls = String(title.className || '');
+    if (cls.includes('formItemTitle')) {
+        // a) лейбл + соседняя ячейка значения
+        const parent = title.parentElement;
+        const idx = Array.prototype.indexOf.call(parent.children, title);
+        const value = parent.children[idx + 1];
+        if (value && !String(value.className || '').includes('formItemTitle')) {
+            targets.push(title, value);
+        } else {
+            targets.push(title);
+        }
+    } else if (title.tagName === 'TD') {
+        // c) GWT: прячем всю строку таблицы
+        const row = title.closest('tr');
+        targets.push(row || title);
+    } else if (title.parentElement && String(title.parentElement.className || '').includes('totalsWrapper')) {
+        // b) итоги: лейбл + значение-сосед
+        targets.push(title);
+        if (title.nextElementSibling) targets.push(title.nextElementSibling);
+    } else {
+        // fallback: прячем сам элемент лейбла + соседа-значение
+        targets.push(title);
+        if (title.nextElementSibling) targets.push(title.nextElementSibling);
+    }
+    return targets.filter(Boolean);
+}
+
+function applyMsHiddenFields() {
+    if (!/online\.moysklad\.ru$/.test(location.hostname)) return;
+    if (msFieldsRevealed || !hiddenFields.length) return;
+
+    msHiddenTargets.forEach(t => { t.el.style.display = ''; });
+    msHiddenTargets = [];
+
+    hiddenFields.forEach(name => {
+        msCollectTargets(name).forEach(el => {
+            el.style.display = 'none';
+            msHiddenTargets.push({ el, name });
+        });
+    });
+}
+
+function restoreMsFields() {
+    msHiddenTargets.forEach(t => { t.el.style.display = ''; });
+    msHiddenTargets = [];
+}
+
+function toggleMsFieldsRevealed() {
+    msFieldsRevealed = !msFieldsRevealed;
+    if (msFieldsRevealed) {
+        restoreMsFields();
+        setStatusText('👁 Скрытые поля показаны (нажмите ещё раз, чтобы спрятать)');
+    } else {
+        applyMsHiddenFields();
+        setStatusText('🙈 Скрытые поля спрятаны');
+    }
+    updateMsRevealButton();
+}
+
+// Панель настройки скрытых полей (в окне настроек)
+function buildMsFieldsPanel() {
+    const panel = document.getElementById('msFieldsPanel');
+    if (!panel) return;
+    panel.innerHTML = '';
+    if (!/online\.moysklad\.ru$/.test(location.hostname)) {
+        const note = document.createElement('div');
+        note.style.cssText = 'font-size:11px;color:#64748b;padding:4px 0;';
+        note.textContent = 'Доступно только на online.moysklad.ru';
+        panel.appendChild(note);
+        return;
+    }
+
+    const fields = [...KNOWN_MS_FIELDS];
+    hiddenFields.forEach(n => { if (!fields.includes(n)) fields.push(n); });
+
+    fields.forEach(name => {
+        const label = document.createElement('label');
+        label.style.cssText = 'display:flex;align-items:center;gap:8px;color:#475569;font-size:11.5px;margin-bottom:5px;cursor:pointer;';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = hiddenFields.includes(name);
+        cb.style.cssText = 'accent-color:#6366f1;width:13px;height:13px;';
+        cb.addEventListener('change', () => {
+            if (cb.checked) {
+                if (!hiddenFields.includes(name)) hiddenFields.push(name);
+            } else {
+                hiddenFields = hiddenFields.filter(n => n !== name);
+            }
+            saveHiddenFields();
+            if (!msFieldsRevealed) applyMsHiddenFields(); else restoreMsFields();
+        });
+        const span = document.createElement('span');
+        span.textContent = name;
+        label.appendChild(cb);
+        label.appendChild(span);
+        panel.appendChild(label);
+    });
+
+    // Кастомное поле: свой текст лейбла
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:5px;margin-top:6px;';
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.placeholder = 'Своё поле: точный текст лейбла…';
+    inp.style.cssText = 'flex:1;padding:4px 7px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;outline:none;box-sizing:border-box;';
+    const add = document.createElement('button');
+    add.textContent = '＋';
+    add.style.cssText = 'width:28px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;border-radius:7px;color:#fff;font-size:13px;cursor:pointer;font-weight:700;';
+    add.addEventListener('click', () => {
+        const v = (inp.value || '').trim();
+        if (!v) return;
+        if (!hiddenFields.includes(v)) hiddenFields.push(v);
+        saveHiddenFields();
+        if (!msFieldsRevealed) applyMsHiddenFields(); else restoreMsFields();
+        buildMsFieldsPanel();
+        setStatusText(`👁 Поле «${v}» добавлено в скрытые`);
+    });
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') add.click(); });
+    row.appendChild(inp);
+    row.appendChild(add);
+    panel.appendChild(row);
+}
+
+// Плавающая кнопка 👁 «показать скрытые» — появляется на МойСклад, когда есть что прятать
+function updateMsRevealButton() {
+    if (!/online\.moysklad\.ru$/.test(location.hostname)) return;
+    let btn = document.getElementById('mcMsRevealBtn');
+    if (!hiddenFields.length) {
+        if (btn) btn.remove();
+        return;
+    }
+    if (!btn) {
+        btn = document.createElement('button');
+        btn.id = 'mcMsRevealBtn';
+        btn.type = 'button';
+        btn.textContent = '👁';
+        btn.title = 'Показать/скрыть спрятанные поля';
+        btn.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483000;width:30px;height:30px;'
+            + 'background:rgba(15,23,42,.82);border:1px solid rgba(148,163,184,.5);border-radius:50%;'
+            + 'color:#e2e8f0;font-size:14px;cursor:pointer;opacity:.55;transition:opacity .15s;'
+            + 'box-shadow:0 2px 8px rgba(0,0,0,.35);padding:0;line-height:1;';
+        btn.addEventListener('mouseenter', () => btn.style.opacity = '1');
+        btn.addEventListener('mouseleave', () => btn.style.opacity = '0.55');
+        btn.addEventListener('click', toggleMsFieldsRevealed);
+        document.body.appendChild(btn);
+    }
+    btn.textContent = msFieldsRevealed ? '🙈' : '👁';
+    btn.style.display = 'block';
+}
+
 /* ===== 08-clear-and-actions.js ===== */
 
 // ─── Очистка текста ───────────────────────────────────────────────────────────
@@ -2018,7 +2233,8 @@ function buildSettingsSnapshot() {
         clearTextEnabled,
         clearTimeout: parseInt(document.getElementById('timeoutSlider')?.value || 500, 10),
         showHatikoLinks: loadShowHatikoLinks(),
-        hatikoSearchMode
+        hatikoSearchMode,
+        hiddenFields: [...hiddenFields]
     };
 }
 
@@ -2078,6 +2294,13 @@ function importSettings(jsonText) {
         saveHatikoSearchMode(data.hatikoSearchMode);
         const sel = document.getElementById('hatikoSearchMode');
         if (sel) sel.value = data.hatikoSearchMode;
+    }
+    if (Array.isArray(data.hiddenFields)) {
+        hiddenFields = data.hiddenFields.filter(n => typeof n === 'string');
+        saveHiddenFields();
+        if (!msFieldsRevealed) applyMsHiddenFields(); else restoreMsFields();
+        buildMsFieldsPanel();
+        updateMsRevealButton();
     }
 
     const area = document.getElementById('mcImportArea');
@@ -2194,6 +2417,10 @@ function openSettingsWindow() {
         </div>
 
         <div style="height:8px;"></div>
+        <button id="msFieldsSettingsBtn" class="mc-btn mc-btn-slate" style="width:100%;">⚙️ Скрытые поля МойСклад</button>
+        <div id="msFieldsPanel" class="mc-panel" style="display:none;max-height:none;"></div>
+
+        <div style="height:8px;"></div>
         <button id="resetFloatPosBtn" class="mc-btn mc-btn-orange" style="width:100%;" data-tip="↺ Вернуть окна в позицию по умолчанию">↺ Сбросить положение окон</button>
 
         <div style="height:8px;"></div>
@@ -2230,6 +2457,12 @@ function openSettingsWindow() {
         const wasHidden = panel.style.display === 'none';
         togglePanel('scheduleSettingsPanel');
         if (wasHidden) buildSchedulePanel();
+    });
+    document.getElementById('msFieldsSettingsBtn').addEventListener('click', () => {
+        const panel = document.getElementById('msFieldsPanel');
+        const wasHidden = panel.style.display === 'none';
+        togglePanel('msFieldsPanel');
+        if (wasHidden) buildMsFieldsPanel();
     });
     document.getElementById('resetFloatPosBtn').addEventListener('click', () => {
         resetFloatWindowPos();
@@ -2363,7 +2596,7 @@ function restoreSelectedAction() {
 }
 
 function togglePanel(id) {
-    const ids = ['calcSettingsPanel', 'scheduleSettingsPanel'];
+    const ids = ['calcSettingsPanel', 'scheduleSettingsPanel', 'msFieldsPanel'];
     ids.forEach(pid => {
         const el = document.getElementById(pid);
         if (!el) return;
@@ -2381,14 +2614,35 @@ function initialize() {
     loadCalcRules();
     loadScheduleReplacements();
     loadChatHistory();
+    loadHiddenFields();
     startPanelBridgeListener();
     schedulePanelCsrfRefresh();
     GM_registerMenuCommand('Открыть мемный чат', createPriceCheckWindow);
         GM_registerMenuCommand('Закрыть мемный чат', closeChatWindow);
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
+        if (/online\.moysklad\.ru$/.test(location.hostname)) {
+            GM_registerMenuCommand('👁 Показать/скрыть поля МойСклад', toggleMsFieldsRevealed);
+        }
     debugLog('init', 'initialized');
-    console.log('Мемный чат v6.2.0 инициализирован');
+    console.log('Мемный чат v6.4.0 инициализирован');
+
+    // Скрытие полей МойСклад: применить и следить за перерисовками SPA
+    if (/online\.moysklad\.ru$/.test(location.hostname) && hiddenFields.length) {
+        applyMsHiddenFields();
+        updateMsRevealButton();
+        msFieldObserver = new MutationObserver(() => {
+            // Дебаунс: SPA-перерисовки шквалом меняют DOM
+            clearTimeout(msFieldObserver._t);
+            msFieldObserver._t = setTimeout(() => {
+                if (msFieldsRevealed) return;
+                msHiddenTargets.forEach(t => { if (!t.el.isConnected) t.el.style.display = ''; });
+                msHiddenTargets = msHiddenTargets.filter(t => t.el.isConnected);
+                applyMsHiddenFields();
+            }, 300);
+        });
+        msFieldObserver.observe(document.body, { childList: true, subtree: true });
+    }
 }
 
 // ─── Production entrypoint ───────────────────────────────────────────────────
