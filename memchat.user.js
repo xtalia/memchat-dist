@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      6.4.0
+// @version      6.5.0
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -25,7 +25,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '6.4.0';
+const MEMCHAT_VERSION = '6.5.0';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -117,6 +117,23 @@ const KNOWN_MS_FIELDS = [
     'Объем', 'Вес', 'Канал продаж', 'Проект', 'Адрес доставки', 'Комментарий',
     'Номер заказа на сайте', 'План. дата отгрузки', 'Договор', 'Валюта документа'
 ];
+
+// ─── Панель быстрых кнопок МойСклад (создать/печать) ─────────────────────────
+// kind → пункты меню тулбара карточки. marker() определяет страницу по hash.
+let msQuickPanelEnabled = true;
+let msQuickObserver = null;
+const MS_QUICK_PANEL_CONFIG = {
+    customerorder: {
+        marker: () => /^#customerorder\/edit/.test(location.hash),
+        create: ['Отгрузка', 'Входящий платеж', 'Приходный ордер'],
+        print: ['[Сервис] Приемная квитанция A4 x2', '[Сервис] Товарный чек', '[Сервис] Договор купли-продажи +акт']
+    },
+    demand: {
+        marker: () => /^#demand\/edit/.test(location.hash),
+        create: ['Входящий платеж', 'Приходный ордер', 'Возврат покупателя'],
+        print: ['Товарный чек 5%', 'Товарный чек Патент', '[Сервис] Товарный чек А4', '[Сервис] Квитанция на б/у']
+    }
+};
 
 const DEBUG_STORAGE_KEY = 'memchat:debug';
 
@@ -260,6 +277,21 @@ function saveHiddenFields() {
         localStorage.setItem(storageKey('hiddenFields_v1'), JSON.stringify(hiddenFields));
     } catch (error) {
         debugError('storage', 'Не удалось сохранить список скрытых полей', error);
+    }
+}
+
+// ─── Панель быстрых кнопок МойСклад ──────────────────────────────────────────
+function loadMsQuickPanelEnabled() {
+    try {
+        if (localStorage.getItem(storageKey('msQuickPanel_v1')) === 'false') msQuickPanelEnabled = false;
+    } catch { /* по умолчанию включена */ }
+}
+
+function saveMsQuickPanelEnabled() {
+    try {
+        localStorage.setItem(storageKey('msQuickPanel_v1'), String(msQuickPanelEnabled));
+    } catch (error) {
+        debugError('storage', 'Не удалось сохранить настройку панели быстрых кнопок', error);
     }
 }
 
@@ -1648,6 +1680,138 @@ function updateMsRevealButton() {
     btn.style.display = 'block';
 }
 
+// ─── Панель быстрых кнопок МойСклад (создать/печать) ─────────────────────────
+// Кнопки-дубли тулбара карточки: клик = открыть меню тулбара и выбрать пункт.
+// Поддерживаются оба механизма меню: React-дропдауны и GWT-попапы.
+
+function msGetToolbarButton(label) {
+    // Новый дизайн МойСклад — настоящие <button>, старый (GWT) — DIV.btn
+    return [...document.querySelectorAll('button, [role=button], .btn')]
+        .find(b => (b.textContent || '').trim() === label && b.offsetHeight > 0 && !b.disabled);
+}
+
+// GWT/React-пункты меню игнорируют голый .click() — нужен полный жест мыши
+function msSyntheticClick(el) {
+    const r = el.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 };
+    el.dispatchEvent(new MouseEvent('mousedown', opts));
+    el.dispatchEvent(new MouseEvent('mouseup', opts));
+    el.dispatchEvent(new MouseEvent('click', opts));
+}
+
+function msClickMenuItem(buttonLabel, itemText) {
+    return new Promise(resolve => {
+        const btn = msGetToolbarButton(buttonLabel);
+        if (!btn) { resolve({ ok: false, why: `Кнопка «${buttonLabel}» не найдена` }); return; }
+        msSyntheticClick(btn);
+        setTimeout(() => {
+            // React-дропдаун: кликабельный div[class*="option"] с точным текстом
+            let target = [...document.querySelectorAll('[class*="option"]')].reverse()
+                .find(o => o.offsetHeight > 0 && o.children.length <= 1 && (o.textContent || '').trim() === itemText);
+            // GWT-попап: TD.gwt-MenuItem
+            if (!target) {
+                target = [...document.querySelectorAll('.gwt-MenuItem')]
+                    .find(i => i.offsetHeight > 0 && (i.textContent || '').trim() === itemText);
+            }
+            if (!target) {
+                setStatusText(`⚠️ «${itemText}» не найдено в меню — выберите вручную`);
+                resolve({ ok: false, why: 'пункт не найден' });
+                return;
+            }
+            msSyntheticClick(target);
+            setStatusText(`✅ ${itemText}`);
+            resolve({ ok: true });
+        }, 700);
+    });
+}
+
+function buildMsQuickPanel() {
+    if (!/online\.moysklad\.ru$/.test(location.hostname)) return;
+    const old = document.getElementById('mcQuickPanel');
+    const oldWrap = document.querySelector('[data-mc-quick-wrap]');
+    const kind = Object.keys(MS_QUICK_PANEL_CONFIG).find(k => MS_QUICK_PANEL_CONFIG[k].marker());
+    if (!kind || !msQuickPanelEnabled) { if (oldWrap) oldWrap.remove(); else if (old) old.remove(); return; }
+    if (old && old.dataset.kind === kind && old.isConnected) return;
+
+    if (oldWrap) oldWrap.remove(); else if (old) old.remove();
+    const cfg = MS_QUICK_PANEL_CONFIG[kind];
+    const anchor = msGetToolbarButton('Создать документ') || msGetToolbarButton('Печать');
+    if (!anchor) return;
+    // минимальный общий контейнер тулбара (содержит и «Создать документ», и «Печать»)
+    const printBtn = msGetToolbarButton('Печать');
+    let bar = anchor.parentElement;
+    while (bar && bar !== document.body && !(printBtn && bar.contains(printBtn))) {
+        bar = bar.parentElement;
+    }
+    if (!bar || bar === document.body) return;
+
+    const panel = document.createElement('div');
+    panel.id = 'mcQuickPanel';
+    panel.dataset.kind = kind;
+    panel.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:4px 0;';
+
+    const mkBtn = (emoji, label, menuLabel) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = `${emoji} ${label}`;
+        b.title = `${menuLabel}: ${label}`;
+        b.style.cssText = 'padding:3px 8px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;'
+            + 'color:#334155;font-size:11px;cursor:pointer;white-space:nowrap;transition:all .15s;';
+        b.addEventListener('mouseenter', () => { b.style.background = '#eef2ff'; b.style.borderColor = '#6366f1'; });
+        b.addEventListener('mouseleave', () => { b.style.background = '#fff'; b.style.borderColor = '#cbd5e1'; });
+        b.addEventListener('click', async () => {
+            panel.querySelectorAll('button').forEach(x => { x.disabled = true; x.style.opacity = '.5'; });
+            await msClickMenuItem(menuLabel, label);
+            panel.querySelectorAll('button').forEach(x => { x.disabled = false; x.style.opacity = '1'; });
+        });
+        return b;
+    };
+
+    cfg.create.forEach(label => panel.appendChild(mkBtn('➕', label, 'Создать документ')));
+    cfg.print.forEach(label => panel.appendChild(mkBtn('🖨', label, 'Печать')));
+
+    const wrap = document.createElement('div');
+    wrap.dataset.mcQuickWrap = '1';
+    wrap.appendChild(panel);
+
+    // GWT-документы (отгрузка и пр. старого дизайна): контейнер — TABLE, тулбар
+    // в строке таблицы. Вставляем панель ОТДЕЛЬНОЙ строкой TR СРАЗУ ПОСЛЕ
+    // строки тулбара (не после заголовка — там панели уезжают вниз формы).
+    // ВАЖНО: b-editor-toolbar содержит вложенные таблицы; ищем ВНЕШНИЙ tbody,
+    // где строка тулбара — прямой ребёнок.
+    const toolbarTable = bar.closest('table.b-editor-toolbar');
+    const extTbody = (() => {
+        if (!toolbarTable) return null;
+        let row = toolbarTable.closest('tr');
+        while (row && row.parentElement && row.parentElement.tagName !== 'TBODY') row = row.parentElement.closest('tr');
+        return row ? row.parentElement : null;
+    })();
+    if (extTbody) {
+        const toolbarRow = [...extTbody.children].find(r => r.contains(toolbarTable));
+        if (toolbarRow) {
+            wrap.style.cssText = 'display:block;width:100%;padding:2px 8px;';
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = toolbarRow.children.length || 1;
+            td.appendChild(wrap);
+            tr.appendChild(td);
+            toolbarRow.after(tr);
+            return;
+        }
+    }
+
+    // React-документы (новый дизайн): поднимаемся до последней flex-строки
+    // и вставляем обёртку (block, width:100%) её следующим соседом.
+    let flexRow = bar;
+    while (flexRow.parentElement && getComputedStyle(flexRow.parentElement).display === 'flex') {
+        flexRow = flexRow.parentElement;
+    }
+    const host = flexRow.parentElement;
+    if (!host) return;
+    wrap.style.cssText = 'display:block;width:100%;';
+    host.insertBefore(wrap, flexRow.nextSibling);
+}
+
 /* ===== 08-clear-and-actions.js ===== */
 
 // ─── Очистка текста ───────────────────────────────────────────────────────────
@@ -2234,7 +2398,8 @@ function buildSettingsSnapshot() {
         clearTimeout: parseInt(document.getElementById('timeoutSlider')?.value || 500, 10),
         showHatikoLinks: loadShowHatikoLinks(),
         hatikoSearchMode,
-        hiddenFields: [...hiddenFields]
+        hiddenFields: [...hiddenFields],
+        msQuickPanelEnabled
     };
 }
 
@@ -2301,6 +2466,13 @@ function importSettings(jsonText) {
         if (!msFieldsRevealed) applyMsHiddenFields(); else restoreMsFields();
         buildMsFieldsPanel();
         updateMsRevealButton();
+    }
+    if (typeof data.msQuickPanelEnabled === 'boolean') {
+        msQuickPanelEnabled = data.msQuickPanelEnabled;
+        saveMsQuickPanelEnabled();
+        const cb = document.getElementById('msQuickPanelCheckbox');
+        if (cb) cb.checked = msQuickPanelEnabled;
+        buildMsQuickPanel();
     }
 
     const area = document.getElementById('mcImportArea');
@@ -2417,6 +2589,12 @@ function openSettingsWindow() {
         </div>
 
         <div style="height:8px;"></div>
+        <label style="display:flex;align-items:center;gap:8px;color:#475569;font-size:12px;margin-bottom:10px;cursor:pointer;">
+            <input type="checkbox" id="msQuickPanelCheckbox" style="accent-color:#6366f1;width:14px;height:14px;">
+            Панель быстрых кнопок (МойСклад)
+        </label>
+
+        <div style="height:8px;"></div>
         <button id="msFieldsSettingsBtn" class="mc-btn mc-btn-slate" style="width:100%;">⚙️ Скрытые поля МойСклад</button>
         <div id="msFieldsPanel" class="mc-panel" style="display:none;max-height:none;"></div>
 
@@ -2464,6 +2642,15 @@ function openSettingsWindow() {
         togglePanel('msFieldsPanel');
         if (wasHidden) buildMsFieldsPanel();
     });
+    const msQuickCb = document.getElementById('msQuickPanelCheckbox');
+    if (msQuickCb) {
+        msQuickCb.checked = msQuickPanelEnabled;
+        msQuickCb.addEventListener('change', () => {
+            msQuickPanelEnabled = msQuickCb.checked;
+            saveMsQuickPanelEnabled();
+            buildMsQuickPanel();
+        });
+    }
     document.getElementById('resetFloatPosBtn').addEventListener('click', () => {
         resetFloatWindowPos();
         closeMemchatOverlay();
@@ -2615,6 +2802,7 @@ function initialize() {
     loadScheduleReplacements();
     loadChatHistory();
     loadHiddenFields();
+    loadMsQuickPanelEnabled();
     startPanelBridgeListener();
     schedulePanelCsrfRefresh();
     GM_registerMenuCommand('Открыть мемный чат', createPriceCheckWindow);
@@ -2625,7 +2813,7 @@ function initialize() {
             GM_registerMenuCommand('👁 Показать/скрыть поля МойСклад', toggleMsFieldsRevealed);
         }
     debugLog('init', 'initialized');
-    console.log('Мемный чат v6.4.0 инициализирован');
+    console.log('Мемный чат v6.5.0 инициализирован');
 
     // Скрытие полей МойСклад: применить и следить за перерисовками SPA
     if (/online\.moysklad\.ru$/.test(location.hostname) && hiddenFields.length) {
@@ -2642,6 +2830,16 @@ function initialize() {
             }, 300);
         });
         msFieldObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // Панель быстрых кнопок МойСклад: строится на карточках, следит за SPA-навигацией
+    if (/online\.moysklad\.ru$/.test(location.hostname) && msQuickPanelEnabled) {
+        buildMsQuickPanel();
+        msQuickObserver = new MutationObserver(() => {
+            clearTimeout(msQuickObserver._t);
+            msQuickObserver._t = setTimeout(buildMsQuickPanel, 400);
+        });
+        msQuickObserver.observe(document.body, { childList: true, subtree: true });
     }
 }
 
