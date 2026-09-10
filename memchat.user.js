@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      6.5.0
-// @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой
+// @version      7.7.0-beta
+// @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
 // @match        https://*.hatiko.ru/*
@@ -16,6 +16,7 @@
 // @connect      docs.google.com
 // @connect      github.com
 // @connect      raw.githubusercontent.com
+// @connect      api.moysklad.ru
 // ==/UserScript==
 
 // Production-файл собирается из js/memchat/src/*.js.
@@ -25,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '6.5.0';
+const MEMCHAT_VERSION = '7.7.0-beta';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -106,6 +107,13 @@ let lastHatikoResults = [];
 let lastHatikoQuery = '';
 let hatikoSearchMode = 'auto';
 let activeRequestId = 0;
+
+// API МойСклад для ХатикоХакера
+let hackerBearerEnabled = false;
+let hackerBearerToken = '';
+let hackerApiValidated = false;
+let hackerDefaultChannel = '';
+let hackerQuickButtonsEnabled = true;
 
 // ─── Скрытие полей МойСклад ──────────────────────────────────────────────────
 let hiddenFields = [];        // имена полей (точный текст лейбла), прячемых на МойСклад
@@ -1725,15 +1733,105 @@ function msClickMenuItem(buttonLabel, itemText) {
     });
 }
 
+function hackerOpenQuickActionPopup(action, anchor) {
+    if (!hackerCanRun()) return;
+    const old = document.getElementById('mcHackerQuickPopup');
+    if (old) { old.remove(); return; }
+    const box = document.createElement('div');
+    box.id = 'mcHackerQuickPopup';
+    box.style.cssText = 'position:fixed;z-index:2147483001;width:300px;padding:12px;background:#fff;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 8px 30px #0f172a40;font:12px Segoe UI,sans-serif;color:#334155;';
+    const r = anchor?.getBoundingClientRect?.();
+    box.style.left = `${Math.max(8, Math.min((r?.left || 20), window.innerWidth - 320))}px`;
+    box.style.top = `${Math.min((r?.bottom || 80) + 5, window.innerHeight - 230)}px`;
+    const title = document.createElement('div');
+    title.textContent = action === 'demand' ? '⚡ Отгрузка' : action === 'cashin' ? '⚡ Приходный ордер' : action === 'paymentin' ? '⚡ Входящий платёж' : '⚡ Кредит/Рассрочка';
+    title.style.cssText = 'font-weight:700;margin-bottom:8px;';
+    box.appendChild(title);
+    const addInput = (id, label, placeholder) => {
+        const l = document.createElement('label'); l.textContent = label; l.style.cssText = 'display:block;margin:6px 0 3px;font-weight:600;';
+        const i = document.createElement('input'); i.id = id; i.type = 'text'; i.placeholder = placeholder || ''; i.style.cssText = HACKER_INPUT_CSS; box.appendChild(l); box.appendChild(i); return i;
+    };
+    if (action === 'demand') {
+        const hint = document.createElement('div'); hint.textContent = 'Канал продаж: как в заказе'; hint.style.color = '#64748b'; box.appendChild(hint);
+    } else {
+        addInput('hackerSaleSum', action === 'credit' ? 'Общая сумма' : 'Сумма', '0');
+        if (action === 'cashin' || action === 'credit') {
+            addInput('hackerCashAmount', 'Наличные', action === 'credit' ? '0' : '');
+            const s = hackerSelect('hackerClientStatusSelect', 'Статус клиента'); s.style.cssText = HACKER_SELECT_CSS; box.appendChild(s); hackerRefreshClientStatuses(true);
+        }
+        if (action === 'paymentin' || action === 'credit') {
+            const s = hackerSelect('hackerPayMethodSelect', 'Способ оплаты'); s.style.cssText = HACKER_SELECT_CSS; box.appendChild(s); hackerRefreshPayMethods(true);
+        }
+    }
+    const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:5px;margin-top:10px;';
+    const go = document.createElement('button'); go.textContent = 'Создать'; go.style.cssText = HACKER_BTN_CSS + 'background:#4f46e5;flex:1;';
+    go.onclick = async () => { if (action === 'demand') await hackerCreateDemand(); else if (action === 'cashin') await hackerCreateCashin(); else if (action === 'paymentin') await hackerCreatePaymentin(); else await hackerCreateCredit(); box.remove(); };
+    const cancel = document.createElement('button'); cancel.textContent = 'Отмена'; cancel.style.cssText = HACKER_MINI_BTN_CSS; cancel.onclick = () => box.remove();
+    row.appendChild(go); row.appendChild(cancel); box.appendChild(row); document.body.appendChild(box);
+    if (action !== 'demand') {
+        if (action === 'cashin' || action === 'credit') hackerRefreshClientStatuses(true);
+        if (action === 'paymentin' || action === 'credit') hackerRefreshPayMethods(true);
+    }
+}
+
+function hackerOpenAgentQuickPopup(anchor) {
+    if (!hackerCanRun()) return;
+    const old = document.getElementById('mcHackerAgentPopup');
+    if (old) { old.remove(); return; }
+    const box = document.createElement('div');
+    box.id = 'mcHackerAgentPopup';
+    box.style.cssText = 'position:fixed;z-index:2147483001;width:300px;padding:12px;background:#fff;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 8px 30px #0f172a40;font:12px Segoe UI,sans-serif;color:#334155;';
+    const r = anchor?.getBoundingClientRect?.();
+    box.style.left = `${Math.max(8, Math.min((r?.left || 20), window.innerWidth - 320))}px`;
+    box.style.top = `${Math.min((r?.bottom || 80) + 5, window.innerHeight - 230)}px`;
+    box.innerHTML = '<b>⚡ Контрагент</b>';
+    const add = (id, label, placeholder) => {
+        const l = document.createElement('label'); l.textContent = label; l.style.cssText = 'display:block;margin:7px 0 3px;font-weight:600;';
+        const i = document.createElement('input'); i.id = id; i.type = 'text'; i.placeholder = placeholder || ''; i.style.cssText = HACKER_INPUT_CSS; box.appendChild(l); box.appendChild(i); return i;
+    };
+    add('hackerAgentName', 'ФИО', 'Иванов Иван Иванович');
+    add('hackerAgentPhone', 'Номер', '+7 900 000-00-00');
+    const check = document.createElement('label'); check.style.cssText = 'display:flex;gap:6px;align-items:center;margin-top:7px;';
+    check.innerHTML = '<input type="checkbox" id="hackerAgentCheckCreate"> если не найден, создать контрагента'; box.appendChild(check);
+    const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:5px;margin-top:10px;';
+    const phone = () => document.getElementById('hackerAgentPhone')?.value.trim();
+    const name = () => document.getElementById('hackerAgentName')?.value.trim();
+    const checkCreate = () => document.getElementById('hackerAgentCheckCreate')?.checked;
+    const assign = document.createElement('button'); assign.textContent = 'Поменять'; assign.style.cssText = HACKER_BTN_CSS + 'background:#4f46e5;flex:1;';
+    assign.onclick = () => hackerFindAgentByPhone(phone()).then(rows => rows.length ? hackerAssignAgent(rows[0].meta.href).then(() => hackerLog('✅ Контрагент заменён', 'ok')) : hackerLog('Контрагент не найден', 'warn')).catch(error => hackerLog('Контрагент: ' + error.message, 'err'));
+    const create = document.createElement('button'); create.textContent = 'Создать'; create.style.cssText = HACKER_BTN_CSS + 'background:#16a34a;flex:1;';
+    create.onclick = () => hackerFindAgentByPhone(phone()).then(rows => { if (rows.length && !checkCreate()) return hackerLog('Контрагент уже найден; создание отменено', 'warn'); return hackerCreateAgent(name(), phone()).then(agent => hackerLog('✅ Контрагент создан', 'ok')); }).catch(error => hackerLog('Контрагент: ' + error.message, 'err'));
+    const verify = document.createElement('button'); verify.textContent = 'Проверить'; verify.style.cssText = HACKER_MINI_BTN_CSS;
+    verify.onclick = () => hackerAgentCheckClick();
+    const close = document.createElement('button'); close.textContent = '✕'; close.style.cssText = HACKER_MINI_BTN_CSS; close.onclick = () => box.remove();
+    row.appendChild(assign); row.appendChild(create); row.appendChild(verify); row.appendChild(close); box.appendChild(row); document.body.appendChild(box);
+}
+
+function buildMsHackerQuickRow(kind) {
+    const row = document.createElement('div');
+    row.id = 'mcHackerQuickRow';
+    row.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:2px 0;';
+    [['demand','⚡+ отгрузка'],['cashin','⚡+ приходный ордер'],['paymentin','⚡+ входящий платёж'],['credit','⚡+ кредит'],['agent','⚡ Контрагент']].forEach(([action,label]) => {
+        const b = document.createElement('button'); b.type='button'; b.textContent=label; b.style.cssText='padding:3px 8px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;font-size:11px;cursor:pointer;'; b.onclick=()=> action === 'agent' ? hackerOpenAgentQuickPopup(b) : hackerOpenQuickActionPopup(action, b); row.appendChild(b);
+    });
+    const sumBtn = document.createElement('button'); sumBtn.type='button'; sumBtn.textContent='🔄 Сумма'; sumBtn.title='Проверить и подставить актуальную сумму заказа'; sumBtn.style.cssText='padding:3px 8px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;font-size:11px;cursor:pointer;'; sumBtn.onclick=() => hackerCheckOrderSum(); row.appendChild(sumBtn);
+    return row;
+}
+
 function buildMsQuickPanel() {
     if (!/online\.moysklad\.ru$/.test(location.hostname)) return;
     const old = document.getElementById('mcQuickPanel');
     const oldWrap = document.querySelector('[data-mc-quick-wrap]');
+    const oldQuickRow = document.getElementById('mcHackerQuickRow');
     const kind = Object.keys(MS_QUICK_PANEL_CONFIG).find(k => MS_QUICK_PANEL_CONFIG[k].marker());
+    // Keep a complete pair stable across MutationObserver callbacks. Rebuilding
+    // on every insertion would make the observer duplicate both rows forever.
+    if (old && old.dataset.kind === kind && old.isConnected && oldQuickRow?.isConnected) return;
+    if (oldQuickRow) oldQuickRow.remove();
     if (!kind || !msQuickPanelEnabled) { if (oldWrap) oldWrap.remove(); else if (old) old.remove(); return; }
-    if (old && old.dataset.kind === kind && old.isConnected) return;
 
     if (oldWrap) oldWrap.remove(); else if (old) old.remove();
+    // The old main panel may have been rebuilt by the SPA; create one fresh pair.
     const cfg = MS_QUICK_PANEL_CONFIG[kind];
     const anchor = msGetToolbarButton('Создать документ') || msGetToolbarButton('Печать');
     if (!anchor) return;
@@ -1745,6 +1843,7 @@ function buildMsQuickPanel() {
     }
     if (!bar || bar === document.body) return;
 
+    if (!hackerQuickButtonsEnabled) { document.getElementById('mcHackerQuickRow')?.remove(); }
     const panel = document.createElement('div');
     panel.id = 'mcQuickPanel';
     panel.dataset.kind = kind;
@@ -1796,6 +1895,13 @@ function buildMsQuickPanel() {
             td.appendChild(wrap);
             tr.appendChild(td);
             toolbarRow.after(tr);
+            if (!hackerQuickButtonsEnabled) return;
+            const quickTr = document.createElement('tr');
+            const quickTd = document.createElement('td');
+            quickTd.colSpan = toolbarRow.children.length || 1;
+            quickTd.appendChild(buildMsHackerQuickRow(kind));
+            quickTr.appendChild(quickTd);
+            tr.after(quickTr);
             return;
         }
     }
@@ -1810,6 +1916,10 @@ function buildMsQuickPanel() {
     if (!host) return;
     wrap.style.cssText = 'display:block;width:100%;';
     host.insertBefore(wrap, flexRow.nextSibling);
+    if (!hackerQuickButtonsEnabled) return;
+    const quickRow = buildMsHackerQuickRow(kind);
+    quickRow.style.cssText += 'width:100%;';
+    host.insertBefore(quickRow, wrap.nextSibling);
 }
 
 /* ===== 08-clear-and-actions.js ===== */
@@ -2152,6 +2262,7 @@ function createPriceCheckWindow() {
                         <div style="font-size:14px;font-weight:700;color:#111827;line-height:1.2;">Мемный чат</div>
                         <div id="memchatTabTitle" style="font-size:10px;font-weight:600;color:#4f46e5;letter-spacing:.3px;margin-top:1px;">🐶 Hatiko</div>
                         <div id="memchatVersion" style="font-size:8.5px;color:#94a3b8;letter-spacing:.5px;margin-top:1px;"></div>
+                        <div id="memchatBearerStatus" style="font-size:8.5px;color:#94a3b8;margin-top:1px;"></div>
                     </div>
                 </div>
                 <button id="priceCheckCloseButton" style="
@@ -2203,6 +2314,7 @@ function createPriceCheckWindow() {
         document.body.appendChild(container);
         window.priceCheckContainer = container;
         document.getElementById('memchatVersion').textContent = `v${MEMCHAT_VERSION}${typeof MEMCHAT_BUILD !== 'undefined' ? `-${MEMCHAT_BUILD}` : ''}`;
+        hackerValidateApiKey(() => {});
         setupEventListeners();
         document.getElementById('hatikoReopenPickerButton').addEventListener('click', reopenHatikoProductPicker);
     }
@@ -2483,8 +2595,8 @@ function importSettings(jsonText) {
     return true;
 }
 
-// ─── Заглушка «ХатикоХакер» ───────────────────────────────────────────────────
-function openHackerStubWindow() {
+// ─── Окно «ХатикоХакер» (логика в 11-hacker.js) ───────────────────────────────
+function openHackerWindow() {
     closeMemchatOverlay();
 
     const win = document.createElement('div');
@@ -2508,17 +2620,80 @@ function openHackerStubWindow() {
     const body = document.createElement('div');
     body.className = 'mc-float-body';
 
-    const stub = document.createElement('div');
-    stub.style.textAlign = 'center';
-    stub.style.padding = '18px 0 6px';
-    stub.innerHTML = '<div style="font-size:40px;">🔧</div>'
-        + '<p style="margin:10px 0 6px;font-size:14px;font-weight:700;color:#111827;">Заглушка для будущих задач</p>'
-        + '<p style="margin:0;font-size:12px;color:#64748b;">Здесь появится автоматизация «Хатико-Техники»: реверс-инжиниринг, серверные интеграции и всё, что мы придумаем дальше.</p>';
-    body.appendChild(stub);
+    const tabs = document.createElement('div');
+    tabs.id = 'hackerTabs';
+    tabs.style.cssText = 'display:flex;gap:4px;margin-bottom:8px;';
+    const HACKER_TABS = [
+        ['status', 'Статус'],
+        ['agent', 'Контрагент'],
+        ['sale', 'Автопродажа']
+    ];
+    HACKER_TABS.forEach(([key, label], i) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = label;
+        btn.dataset.hackerTab = key;
+        btn.style.cssText = 'flex:1;padding:5px 4px;border:1px solid #e2e8f0;border-radius:8px;'
+            + 'background:#f8fafc;color:#475569;font-size:11px;font-weight:600;cursor:pointer;'
+            + 'transition:all .15s;white-space:nowrap;';
+        btn.addEventListener('click', () => hackerSelectTab(key));
+        tabs.appendChild(btn);
+    });
+    body.appendChild(tabs);
+
+    const panes = document.createElement('div');
+    panes.id = 'hackerTabPanes';
+    body.appendChild(panes);
+
+    // Консоль внизу
+    const logLabel = hackerEl('div', 'font-size:10px;font-weight:800;color:#64748b;text-transform:uppercase;'
+        + 'letter-spacing:.8px;margin:10px 0 4px;', 'Консоль');
+    body.appendChild(logLabel);
+    const logBox = document.createElement('div');
+    logBox.id = 'hackerLogBox';
+    logBox.style.cssText = 'height:120px;overflow-y:auto;background:#0f172a;border-radius:10px;'
+        + 'padding:7px;font-size:10.5px;line-height:1.5;font-family:Consolas,monospace;';
+    body.appendChild(logBox);
 
     win.appendChild(body);
     document.body.appendChild(win);
     makeMovable(win, header);
+
+    hackerSelectTab(hackerTab);
+    hackerRenderLog();
+    hackerRefreshStates(true);
+    if (/online\.moysklad\.ru$/.test(location.hostname)) hackerLoadOpenOrder(true);
+}
+
+// Переключение вкладок Хакера (панели строятся в 11-hacker.js)
+function hackerSelectTab(key) {
+    hackerTab = key;
+    const tabsEl = document.getElementById('hackerTabs');
+    if (tabsEl) {
+        tabsEl.querySelectorAll('[data-hacker-tab]').forEach(t => {
+            const active = t.dataset.hackerTab === key;
+            t.style.background = active ? 'linear-gradient(135deg,#6366f1,#8b5cf6)' : '#f8fafc';
+            t.style.color = active ? '#fff' : '#475569';
+            t.style.borderColor = active ? 'transparent' : '#e2e8f0';
+        });
+    }
+    const panes = document.getElementById('hackerTabPanes');
+    if (!panes) return;
+    panes.innerHTML = '';
+    let pane = null;
+    if (key === 'status') pane = hackerBuildStatusTab();
+    else if (key === 'agent') pane = hackerBuildAgentTab();
+    else if (key === 'sale') pane = hackerBuildSaleTab();
+    if (pane) panes.appendChild(pane);
+
+    // Справочники загружаются при открытии соответствующей вкладки.
+    if (key === 'status') hackerRefreshStates(true);
+    if (key === 'sale') {
+        hackerRefreshClientStatuses(true);
+        hackerRefreshPayMethods(true);
+        hackerRefreshSalesChannels(true);
+        hackerLoadOpenOrder(true);
+    }
 }
 
 // ─── Окно «Настройки» ─────────────────────────────────────────────────────────
@@ -2595,6 +2770,25 @@ function openSettingsWindow() {
         </label>
 
         <div style="height:8px;"></div>
+        <label style="display:flex;align-items:center;gap:8px;color:#475569;font-size:12px;margin-bottom:10px;cursor:pointer;">
+            <input type="checkbox" id="msBearerCheckbox" style="accent-color:#6366f1;width:14px;height:14px;">
+            Bearer-ключ API МойСклад
+        </label>
+        <input type="text" id="msBearerToken" placeholder="API-ключ МойСклад (Bearer)…" spellcheck="false"
+            style="display:none;width:100%;padding:5px 7px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;outline:none;box-sizing:border-box;margin-bottom:10px;">
+
+        <label style="display:block;color:#475569;font-size:12px;margin-bottom:8px;">
+            Канал продаж по умолчанию
+            <select id="hackerDefaultChannel" style="display:block;width:100%;margin-top:4px;padding:5px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;">
+                <option value="">Как в заказе / рандом</option>
+            </select>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;color:#475569;font-size:12px;margin-bottom:10px;cursor:pointer;">
+            <input type="checkbox" id="hackerQuickButtonsCheckbox" style="accent-color:#6366f1;width:14px;height:14px;">
+            Показывать ⚡-кнопки
+        </label>
+
+        <div style="height:8px;"></div>
         <button id="msFieldsSettingsBtn" class="mc-btn mc-btn-slate" style="width:100%;">⚙️ Скрытые поля МойСклад</button>
         <div id="msFieldsPanel" class="mc-panel" style="display:none;max-height:none;"></div>
 
@@ -2650,6 +2844,28 @@ function openSettingsWindow() {
             saveMsQuickPanelEnabled();
             buildMsQuickPanel();
         });
+    }
+    const defaultChannel = document.getElementById('hackerDefaultChannel');
+    if (defaultChannel) {
+        defaultChannel.value = hackerDefaultChannel;
+        hackerRefreshSalesChannels(true).then(() => {
+            hackerSalesChannels.forEach(item => {
+                const option = document.createElement('option'); option.value = item.href; option.textContent = item.name; defaultChannel.appendChild(option);
+            });
+            defaultChannel.value = hackerDefaultChannel;
+        });
+        defaultChannel.addEventListener('change', () => { hackerDefaultChannel = defaultChannel.value; localStorage.setItem(storageKey('hackerDefaultChannel_v1'), hackerDefaultChannel); });
+    }
+    const quickCb = document.getElementById('hackerQuickButtonsCheckbox');
+    if (quickCb) { quickCb.checked = hackerQuickButtonsEnabled; quickCb.addEventListener('change', () => { hackerQuickButtonsEnabled = quickCb.checked; localStorage.setItem(storageKey('hackerQuickButtons_v1'), String(hackerQuickButtonsEnabled)); buildMsQuickPanel(); }); }
+    const bearerCb = document.getElementById('msBearerCheckbox');
+    const bearerInp = document.getElementById('msBearerToken');
+    if (bearerCb && bearerInp) {
+        bearerCb.checked = hackerBearerEnabled;
+        bearerInp.style.display = hackerBearerEnabled ? 'block' : 'none';
+        bearerInp.value = hackerBearerToken;
+        bearerCb.addEventListener('change', () => hackerSetBearerEnabled(bearerCb.checked));
+        bearerInp.addEventListener('input', () => hackerSetBearerToken(bearerInp.value));
     }
     document.getElementById('resetFloatPosBtn').addEventListener('click', () => {
         resetFloatWindowPos();
@@ -2733,7 +2949,9 @@ function setupEventListeners() {
         // Быстрые действия и настройки (нижняя панель)
             document.getElementById('mcActionToday').addEventListener('click', fetchWhoWorksToday);
             document.getElementById('mcActionTomorrow').addEventListener('click', fetchWhoWorksTomorrow);
-            document.getElementById('mcActionHacker').addEventListener('click', openHackerStubWindow);
+            document.getElementById('mcActionHacker').addEventListener('click', () => {
+                if (hackerCanRun()) openHackerWindow();
+            });
             document.getElementById('mcActionSettings').addEventListener('click', openSettingsWindow);
 
             // Тултипы → статус-бар (текст внизу, рядом с кнопками)
@@ -2794,6 +3012,7 @@ function togglePanel(id) {
 // ─── Инициализация ────────────────────────────────────────────────────────────
 function closeChatWindow() {
     if (window.priceCheckContainer) window.priceCheckContainer.style.display = 'none';
+    document.querySelectorAll('.mc-float-window, .mc-overlay, #mcHackerQuickPopup, #mcHackerAgentPopup, #mcHackerFloatingLog').forEach(el => el.remove());
 }
 
 function initialize() {
@@ -2803,6 +3022,11 @@ function initialize() {
     loadChatHistory();
     loadHiddenFields();
     loadMsQuickPanelEnabled();
+    hackerLoadSettings();
+    try {
+        hackerDefaultChannel = localStorage.getItem(storageKey('hackerDefaultChannel_v1')) || '';
+        hackerQuickButtonsEnabled = localStorage.getItem(storageKey('hackerQuickButtons_v1')) !== 'false';
+    } catch { /* defaults */ }
     startPanelBridgeListener();
     schedulePanelCsrfRefresh();
     GM_registerMenuCommand('Открыть мемный чат', createPriceCheckWindow);
@@ -2813,7 +3037,7 @@ function initialize() {
             GM_registerMenuCommand('👁 Показать/скрыть поля МойСклад', toggleMsFieldsRevealed);
         }
     debugLog('init', 'initialized');
-    console.log('Мемный чат v6.5.0 инициализирован');
+    console.log('Мемный чат v7.7.0-beta инициализирован');
 
     // Скрытие полей МойСклад: применить и следить за перерисовками SPA
     if (/online\.moysklad\.ru$/.test(location.hostname) && hiddenFields.length) {
@@ -2841,6 +3065,1153 @@ function initialize() {
         });
         msQuickObserver.observe(document.body, { childList: true, subtree: true });
     }
+}
+
+/* ===== 11-hacker.js ===== */
+
+// ─── ХатикоХакер (МойСклад API) ───────────────────────────────────────────────
+// Плавающее окно: вкладки «Статус», «Контрагент», «Автопродажа» + консоль-лог внизу.
+// Транспорт: GM_xmlhttpRequest → https://api.moysklad.ru/api/remap/1.2/
+// Авторизация: Bearer-ключ из настроек (по умолчанию выкл — тогда cookies сессии).
+
+const MS_API_BASE = 'https://api.moysklad.ru/api/remap/1.2';
+
+let hackerTab            = 'status';
+let hackerLogLines       = [];
+let hackerStates         = [];  // [{name, href}] — статусы заказов покупателей
+let hackerClientStatuses = [];  // [{name, href}] — атрибут cashin «Статус клиента»
+let hackerPayMethods     = [];  // [{name, href}] — атрибут paymentin «Способ оплаты»
+let hackerSalesChannels  = [];  // [{name, href}]
+let hackerOrderInfo      = null;
+let hackerLastDemand     = null;
+let hackerBusy           = false;
+
+const HACKER_ATTR_CLIENT_STATUS = 'Статус клиента';
+const HACKER_ATTR_PAY_METHOD    = 'Способ оплаты';
+const HACKER_ATTR_PAY_TYPE      = 'Тип оплаты';
+const HACKER_CASH_PAY_NAME       = 'Наличными';
+
+// ─── Настройки API-ключа (localStorage) ───────────────────────────────────────
+function hackerLoadSettings() {
+    try {
+        const s = JSON.parse(localStorage.getItem(storageKey('hackerMsApi_v1')) || '{}');
+        hackerBearerEnabled = !!s.bearerEnabled;
+        hackerBearerToken = typeof s.token === 'string' ? s.token : '';
+    } catch {
+        hackerBearerEnabled = false;
+        hackerBearerToken = '';
+    }
+}
+
+function hackerSaveSettings() {
+    try {
+        localStorage.setItem(storageKey('hackerMsApi_v1'), JSON.stringify({
+            bearerEnabled: hackerBearerEnabled,
+            token: hackerBearerToken
+        }));
+    } catch (error) {
+        debugError('hacker', 'Не удалось сохранить настройки API', error);
+    }
+}
+
+// Вызывается из окна настроек (09)
+function hackerSetBearerEnabled(enabled) {
+    hackerBearerEnabled = !!enabled;
+    hackerApiValidated = false;
+    hackerSaveSettings();
+    const inp = document.getElementById('msBearerToken');
+    if (inp) inp.style.display = hackerBearerEnabled ? 'block' : 'none';
+}
+
+function hackerUpdateBearerStatus(code, text) {
+    const el = document.getElementById('memchatBearerStatus');
+    if (!el) return;
+    el.textContent = hackerBearerEnabled ? `Bearer: ${code}${text ? ` — ${text}` : ''}` : '';
+    el.style.color = code >= 200 && code < 300 ? '#16a34a' : '#dc2626';
+}
+
+function hackerValidateApiKey(onDone) {
+    if (!hackerBearerEnabled || !hackerBearerToken.trim()) {
+        hackerApiValidated = false;
+        hackerUpdateBearerStatus('—', 'выкл');
+        onDone?.(false);
+        return;
+    }
+    msApi('GET', '/entity/customerorder/metadata', null, response => {
+        hackerApiValidated = true;
+        hackerUpdateBearerStatus(response?._status || 200, 'валиден');
+        onDone?.(true);
+    }, error => {
+        hackerApiValidated = false;
+        hackerUpdateBearerStatus(error?.status || 401, 'ошибка');
+        onDone?.(false);
+    });
+}
+
+function hackerCanRun(onDenied) {
+    if (!hackerBearerEnabled || !hackerBearerToken.trim() || !hackerApiValidated) {
+        hackerValidateApiKey(ok => {
+            if (!ok) {
+                hackerLog('Включите Bearer и укажите действующий API-ключ МойСклад', 'warn');
+                onDenied?.();
+            }
+        });
+        return false;
+    }
+    return true;
+}
+
+function hackerSetBearerToken(value) {
+    hackerBearerToken = String(value || '');
+    hackerApiValidated = false;
+    hackerSaveSettings();
+}
+
+// ─── Транспорт ────────────────────────────────────────────────────────────────
+function msApi(method, path, body, onSuccess, onError) {
+    const headers = { 'Accept': 'application/json;charset=utf-8' };
+    if (body) headers['Content-Type'] = 'application/json;charset=utf-8';
+    if (hackerBearerEnabled && hackerBearerToken.trim()) {
+        headers['Authorization'] = 'Bearer ' + hackerBearerToken.trim();
+    }
+    GM_xmlhttpRequest({
+        method,
+        url: MS_API_BASE + path,
+        headers,
+        data: body ? JSON.stringify(body) : undefined,
+        timeout: 30000,
+        anonymous: false,
+        onload: response => {
+            const raw = response.responseText || '';
+            let data = null;
+            try { data = raw ? JSON.parse(raw) : null; } catch (e) { /* не JSON */ }
+            if (response.status >= 200 && response.status < 300) {
+                if (data && typeof data === 'object') data._status = response.status;
+                onSuccess(data);
+            } else {
+                const apiMsg = data && data.errors && data.errors[0]
+                    ? (data.errors[0].error || data.errors[0].parameter || data.errors[0].code || JSON.stringify(data.errors[0]))
+                    : '';
+                let msg = apiMsg || ('HTTP ' + response.status);
+                if (response.status === 401 && !hackerBearerEnabled) {
+                    msg += ' — включите «Bearer-ключ API» в настройках и вставьте API-ключ';
+                }
+                const err = new Error(msg); err.status = response.status; onError(err);
+            }
+        },
+        onerror: () => onError(new Error('Ошибка сети (api.moysklad.ru)')),
+        ontimeout: () => onError(new Error('Таймаут запроса к api.moysklad.ru'))
+    });
+}
+
+function msApiP(method, path, body) {
+    return new Promise((resolve, reject) => msApi(method, path, body, resolve, reject));
+}
+
+// ─── Консоль-лог ──────────────────────────────────────────────────────────────
+function hackerLog(msg, kind) {
+    hackerLogLines.push({ time: new Date(), msg: String(msg), kind: kind || 'info' });
+    if (hackerLogLines.length > 300) hackerLogLines.shift();
+    hackerRenderLog();
+    hackerRenderFloatingLog();
+}
+
+function hackerRenderFloatingLog() {
+    const box = document.getElementById('mcHackerFloatingLog');
+    if (!box) return;
+    const body = box.querySelector('[data-hacker-floating-body]');
+    if (!body) return;
+    body.textContent = hackerLogLines.slice(-8).map(entry => {
+        const t = entry.time.toTimeString().slice(0, 8);
+        return `[${t}] ${entry.msg}`;
+    }).join('\n');
+    body.scrollTop = body.scrollHeight;
+}
+
+function hackerEnsureFloatingLog() {
+    let box = document.getElementById('mcHackerFloatingLog');
+    if (box) return box;
+    box = document.createElement('div');
+    box.id = 'mcHackerFloatingLog';
+    box.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483002;width:310px;background:#0f172a;color:#cbd5e1;border:1px solid #475569;border-radius:9px;box-shadow:0 8px 30px #0005;font:10px Consolas,monospace;';
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid #334155;color:#f8fafc;font:600 11px Segoe UI,sans-serif;';
+    head.textContent = 'ХатикоХакер — статус';
+    const close = document.createElement('button'); close.textContent = '✕'; close.style.cssText = 'border:0;background:transparent;color:#cbd5e1;cursor:pointer;'; close.onclick = () => box.remove();
+    head.appendChild(close); box.appendChild(head);
+    const body = document.createElement('pre'); body.dataset.hackerFloatingBody = '1'; body.style.cssText = 'margin:0;padding:7px 8px;height:100px;overflow:auto;white-space:pre-wrap;';
+    box.appendChild(body); document.body.appendChild(box); hackerRenderFloatingLog(); return box;
+}
+
+function hackerRenderLog() {
+    const box = document.getElementById('hackerLogBox');
+    if (!box) return;
+    box.innerHTML = '';
+    const colors = { info: '#94a3b8', ok: '#4ade80', err: '#f87171', warn: '#fbbf24' };
+    hackerLogLines.forEach(entry => {
+        const line = document.createElement('div');
+        const t = entry.time.toTimeString().slice(0, 8);
+        line.style.cssText = 'white-space:pre-wrap;word-break:break-word;';
+        line.style.color = colors[entry.kind] || colors.info;
+        line.textContent = `[${t}] ${entry.msg}`;
+        box.appendChild(line);
+    });
+    box.scrollTop = box.scrollHeight;
+}
+
+// ─── Вспомогательные ──────────────────────────────────────────────────────────
+// Открытая карточка: заказ покупателя или отгрузка
+function hackerOpenDoc() {
+    const m = (location.hash || '').match(/^#(customerorder|demand)\/edit\?id=([0-9a-fA-F-]+)/);
+    return m ? { type: m[1], id: m[2] } : null;
+}
+
+function hackerEl(tag, css, text) {
+    const el = document.createElement(tag);
+    if (css) el.style.cssText = css;
+    if (text !== undefined) el.textContent = text;
+    return el;
+}
+
+function hackerBtn(id, label, css) {
+    const b = hackerEl('button', css || '', label);
+    b.type = 'button';
+    b.id = id;
+    return b;
+}
+
+const HACKER_SELECT_CSS = 'flex:1;padding:4px 6px;background:#fff;border:1px solid #cbd5e1;'
+    + 'border-radius:7px;color:#334155;font-size:11px;outline:none;min-width:0;';
+const HACKER_INPUT_CSS = 'width:100%;padding:4px 7px;background:#fff;border:1px solid #cbd5e1;'
+    + 'border-radius:7px;color:#334155;font-size:11.5px;outline:none;box-sizing:border-box;';
+const HACKER_BTN_CSS = 'padding:5px 10px;border:none;border-radius:7px;color:#fff;font-size:11px;'
+    + 'cursor:pointer;font-weight:600;transition:filter .15s;';
+const HACKER_MINI_BTN_CSS = 'padding:4px 8px;background:#fff;border:1px solid #cbd5e1;'
+    + 'border-radius:7px;color:#475569;font-size:11px;cursor:pointer;font-weight:700;';
+
+function hackerSelect(id, placeholder) {
+    const sel = document.createElement('select');
+    sel.id = id;
+    sel.style.cssText = HACKER_SELECT_CSS;
+    if (placeholder) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = placeholder;
+        sel.appendChild(opt);
+    }
+    return sel;
+}
+
+function hackerFillSelect(sel, items, keepEmptyPlaceholder) {
+    // Ответ API может прийти после переключения вкладки: старый select уже удалён.
+    if (!sel || !sel.isConnected) return false;
+    const placeholder = keepEmptyPlaceholder ? sel.querySelector('option[value=""]') : null;
+    sel.innerHTML = '';
+    if (placeholder) sel.appendChild(placeholder);
+    items.forEach(item => {
+        const opt = document.createElement('option');
+        opt.value = item.href;
+        opt.textContent = item.name;
+        sel.appendChild(opt);
+    });
+}
+
+// ─── Открытый заказ: загрузка и предзаполнение ────────────────────────────────
+function hackerLoadOpenOrder(quiet) {
+    const doc = hackerOpenDoc();
+    if (!doc || doc.type !== 'customerorder') {
+        if (!quiet) hackerLog('Откройте карточку заказа покупателя', 'warn');
+        return Promise.resolve(null);
+    }
+    return msApiP('GET', '/entity/customerorder/' + doc.id + '?expand=positions.assortment')
+        .then(order => {
+            hackerOrderInfo = order;
+            hackerLog(`Заказ ${order.name}: сумма ${(order.sum / 100).toFixed(2)} ₽, статус: ${order.state?.name || '—'}`);
+            // Предзаполнение сумм и канала
+            const sumStr = (order.sum / 100).toFixed(2);
+            ['hackerCashinSum', 'hackerPayinSum'].forEach(id => {
+                const inp = document.getElementById(id);
+                if (inp && !inp.value.trim()) inp.value = sumStr;
+            });
+            if (order.salesChannel && order.salesChannel.meta) {
+                const sel = document.getElementById('hackerChannelSelect');
+                if (sel) {
+                    const href = order.salesChannel.meta.href;
+                    if (![...sel.options].some(o => o.value === href)) {
+                        const opt = document.createElement('option');
+                        opt.value = href;
+                        opt.textContent = order.salesChannel.name || '(канал заказа)';
+                        sel.appendChild(opt);
+                    }
+                    sel.value = href;
+                }
+            }
+            return order;
+        })
+        .catch(error => {
+            hackerLog('Не удалось загрузить заказ: ' + error.message, 'err');
+            return null;
+        });
+}
+
+// ─── Вкладка «Статус» ─────────────────────────────────────────────────────────
+function hackerRefreshStates(quiet) {
+    return msApiP('GET', '/entity/customerorder/metadata')
+        .then(meta => {
+            const states = Array.isArray(meta.states) ? meta.states : (meta.states?.rows || []);
+            hackerStates = states.map(s => ({
+                name: s.name,
+                href: s.meta?.href
+            })).filter(s => s.href);
+            hackerFillSelect(document.getElementById('hackerStateSelect'), hackerStates);
+            if (!quiet) hackerLog(`Статусы обновлены: ${hackerStates.length} шт.`, 'ok');
+        })
+        .catch(error => hackerLog('Статусы: ' + error.message, 'err'));
+}
+
+function hackerApplyStatus() {
+    const doc = hackerOpenDoc();
+    if (!doc || doc.type !== 'customerorder') {
+        hackerLog('Откройте карточку заказа покупателя', 'warn');
+        return;
+    }
+    const sel = document.getElementById('hackerStateSelect');
+    const href = sel ? sel.value : '';
+    if (!href) {
+        hackerLog('Выберите статус (или обновите список)', 'warn');
+        return;
+    }
+    const stateName = hackerStates.find(s => s.href === href)?.name || '';
+    msApi('PUT', '/entity/customerorder/' + doc.id, {
+        state: { meta: { href, type: 'state' } }
+    }, () => {
+        hackerLog(`✅ Статус изменён: ${stateName}`, 'ok');
+    }, error => hackerLog('Статус: ' + error.message, 'err'));
+}
+
+function hackerBuildStatusTab() {
+    const wrap = hackerEl('div');
+    wrap.id = 'hackerTabStatus';
+
+    const row = hackerEl('div', 'display:flex;gap:4px;margin-bottom:6px;');
+    row.appendChild(hackerSelect('hackerStateSelect', '— обновите список —'));
+    const refresh = hackerBtn('hackerStatesRefresh', '⟳', HACKER_MINI_BTN_CSS);
+    refresh.title = 'Обновить список статусов';
+    refresh.addEventListener('click', () => hackerRefreshStates(false));
+    row.appendChild(refresh);
+    wrap.appendChild(row);
+
+    const apply = hackerBtn('hackerStatusApply', 'Поменять статус',
+        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#3b82f6,#2563eb);width:100%;');
+    apply.addEventListener('click', hackerApplyStatus);
+    wrap.appendChild(apply);
+    return wrap;
+}
+
+// ─── Вкладка «Контрагент» ─────────────────────────────────────────────────────
+function hackerNormalizePhoneVariants(raw) {
+    const digits = String(raw || '').replace(/\D/g, '');
+    if (!digits) return [];
+    const variants = [digits];
+    if (digits.length === 11 && digits[0] === '8') variants.push('7' + digits.slice(1));
+    if (digits.length === 11 && digits[0] === '7') variants.push('8' + digits.slice(1));
+    if (digits.length === 10) variants.push('7' + digits);
+    return [...new Set(variants)];
+}
+
+function hackerFindAgentByPhone(raw) {
+    const variants = hackerNormalizePhoneVariants(raw);
+    const tryNext = (i) => {
+        if (i >= variants.length) return Promise.resolve([]);
+        return msApiP('GET', '/entity/counterparty?filter=phone=' + variants[i])
+            .then(data => (data.rows && data.rows.length) ? data.rows : tryNext(i + 1))
+            .catch(() => tryNext(i + 1));
+    };
+    return tryNext(0);
+}
+
+function hackerCreateAgent(name, phone) {
+    return msApiP('POST', '/entity/counterparty', { name, phone });
+}
+
+function hackerAssignAgent(agentHref) {
+    const doc = hackerOpenDoc();
+    if (!doc) {
+        hackerLog('Откройте карточку заказа или отгрузки', 'warn');
+        return Promise.reject(new Error('нет открытого документа'));
+    }
+    return msApiP('PUT', '/entity/' + doc.type + '/' + doc.id, {
+        agent: {
+            meta: {
+                href: agentHref,
+                type: 'counterparty',
+                mediaType: 'application/json'
+            }
+        }
+    });
+}
+
+function hackerAgentCreateClick() {
+    const phone = document.getElementById('hackerAgentPhone')?.value.trim();
+    const name = document.getElementById('hackerAgentName')?.value.trim();
+    const checkFirst = document.getElementById('hackerAgentCheckCreate')?.checked;
+    const createAndAssign = document.getElementById('hackerAgentCreateAssign')?.checked;
+    if (!phone) { hackerLog('Введите номер телефона', 'warn'); return; }
+    if (!name) { hackerLog('Введите ФИО (наименование контрагента)', 'warn'); return; }
+
+    const doCreate = () => hackerCreateAgent(name, phone)
+        .then(agent => {
+            hackerLog(`✅ Контрагент создан: ${agent.name}`, 'ok');
+            if (createAndAssign) {
+                return hackerAssignAgent(agent.meta.href)
+                    .then(() => hackerLog('✅ Привязан к документу', 'ok'))
+                    .catch(error => hackerLog('Привязка: ' + error.message, 'err'));
+            }
+        })
+        .catch(error => hackerLog('Создание: ' + error.message, 'err'));
+
+    if (checkFirst) {
+        hackerLog('Ищу контрагента по номеру…');
+        hackerFindAgentByPhone(phone).then(rows => {
+            if (rows.length) {
+                const a = rows[0];
+                hackerLog(`Найден: ${a.name} (телефон ${a.phone || '—'})`, 'warn');
+                if (createAndAssign) {
+                    hackerAssignAgent(a.meta.href)
+                        .then(() => hackerLog('✅ Привязан к документу', 'ok'))
+                        .catch(error => hackerLog('Привязка: ' + error.message, 'err'));
+                } else {
+                    hackerLog('Создание не требуется', 'info');
+                }
+                return;
+            }
+            doCreate();
+        });
+    } else {
+        doCreate();
+    }
+}
+
+function hackerAgentCheckClick() {
+    const phone = document.getElementById('hackerAgentPhone')?.value.trim();
+    if (!phone) { hackerLog('Введите номер телефона', 'warn'); return; }
+    hackerLog('Проверяю контрагента по номеру…');
+    hackerFindAgentByPhone(phone).then(rows => {
+        if (!rows.length) {
+            hackerLog('Контрагент по этому номеру не найден', 'warn');
+            return;
+        }
+        rows.forEach((agent, index) => {
+            hackerLog(`Найден ${index + 1}: ${agent.name || 'без имени'} — ${agent.phone || phone}`, 'ok');
+        });
+    }).catch(error => hackerLog('Проверка: ' + error.message, 'err'));
+}
+
+function hackerAgentAssignClick() {
+    const phone = document.getElementById('hackerAgentPhone')?.value.trim();
+    if (!phone) { hackerLog('Введите номер телефона', 'warn'); return; }
+    hackerFindAgentByPhone(phone).then(rows => {
+        if (!rows.length) {
+            hackerLog('Контрагент по этому номеру не найден', 'err');
+            return;
+        }
+        const a = rows[0];
+        hackerAssignAgent(a.meta.href)
+            .then(() => hackerLog(`✅ Контрагент заменён: ${a.name}`, 'ok'))
+            .catch(error => hackerLog('Замена: ' + error.message, 'err'));
+    });
+}
+
+function hackerBuildAgentTab() {
+    const wrap = hackerEl('div');
+    wrap.id = 'hackerTabStatus_Agent';
+
+    const lblPhone = hackerEl('div', 'font-size:10px;font-weight:700;color:#64748b;margin-bottom:3px;', 'Номер телефона');
+    wrap.appendChild(lblPhone);
+    const phone = hackerEl('input');
+    phone.id = 'hackerAgentPhone';
+    phone.type = 'text';
+    phone.placeholder = '+7 900 000-00-00';
+    phone.style.cssText = HACKER_INPUT_CSS + 'margin-bottom:6px;';
+    wrap.appendChild(phone);
+
+    const lblName = hackerEl('div', 'font-size:10px;font-weight:700;color:#64748b;margin-bottom:3px;', 'ФИО (наименование)');
+    wrap.appendChild(lblName);
+    const name = hackerEl('input');
+    name.id = 'hackerAgentName';
+    name.type = 'text';
+    name.placeholder = 'Иванов Иван Иванович';
+    name.style.cssText = HACKER_INPUT_CSS + 'margin-bottom:6px;';
+    wrap.appendChild(name);
+
+    const row = hackerEl('div', 'display:flex;gap:5px;margin-bottom:8px;');
+    const check = hackerBtn('hackerAgentCheck', 'Проверить',
+        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#64748b,#475569);flex:1;');
+    check.addEventListener('click', hackerAgentCheckClick);
+    const assign = hackerBtn('hackerAgentAssign', 'Поменять',
+        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#3b82f6,#2563eb);flex:1;');
+    assign.addEventListener('click', hackerAgentAssignClick);
+    const create = hackerBtn('hackerAgentCreate', 'Создать',
+        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#22c55e,#16a34a);flex:1;');
+    create.addEventListener('click', hackerAgentCreateClick);
+    row.appendChild(check);
+    row.appendChild(assign);
+    row.appendChild(create);
+    wrap.appendChild(row);
+
+    const mkCheck = (id, label) => {
+        const lbl = hackerEl('label', 'display:flex;align-items:center;gap:7px;color:#475569;font-size:11px;margin-bottom:5px;cursor:pointer;');
+        const cb = hackerEl('input');
+        cb.type = 'checkbox';
+        cb.id = id;
+        cb.style.cssText = 'accent-color:#6366f1;width:13px;height:13px;';
+        lbl.appendChild(cb);
+        lbl.appendChild(document.createTextNode(label));
+        return lbl;
+    };
+    wrap.appendChild(mkCheck('hackerAgentCheckCreate', 'Проверить и если нет — создать'));
+    wrap.appendChild(mkCheck('hackerAgentCreateAssign', 'Создать и поменять контрагента'));
+    return wrap;
+}
+
+// ─── Справочники для «Автопродажи» ────────────────────────────────────────────
+function hackerApiPath(href) {
+    if (!href) return '';
+    return href.startsWith(MS_API_BASE) ? href.slice(MS_API_BASE.length) : href;
+}
+
+function hackerMetaRef(href, type) {
+    return { href, type, mediaType: 'application/json' };
+}
+
+function hackerIsDuplicateNameError(error) {
+    return /имя|назван|дубликат|уже существует|занят|duplicate|name/i.test(String(error?.message || error));
+}
+
+async function hackerPostWithNameRetry(entityType, body, baseName, maxAttempts = 10) {
+    let lastError;
+    for (let i = 0; i < maxAttempts; i += 1) {
+        const name = i === 0 ? baseName : `${baseName}-${i}`;
+        try {
+            return await msApiP('POST', '/entity/' + entityType, { ...body, name });
+        } catch (error) {
+            lastError = error;
+            if (!hackerIsDuplicateNameError(error)) throw error;
+            hackerLog(`Имя «${name}» занято, пробую «${baseName}-${i + 1}»…`, 'warn');
+        }
+    }
+    throw lastError || new Error('Не удалось создать документ с уникальным именем');
+}
+
+function hackerFetchMetadataAttribute(entityType, attrName) {
+    return msApiP('GET', '/entity/' + entityType + '/metadata').then(meta => {
+        const href = meta.attributes?.meta?.href;
+        if (!href) return null;
+        return msApiP('GET', hackerApiPath(href)).then(data =>
+            (data.rows || []).find(a => a.name === attrName || new RegExp(attrName, 'i').test(a.name || '')) || null
+        );
+    });
+}
+
+function hackerFetchDemandChannelAttribute(order, channelName) {
+    const source = (Array.isArray(order.attributes) ? order.attributes : (order.attributes?.rows || []))
+        .find(a => /канал продаж/i.test(a.name || ''));
+    return hackerFetchMetadataAttribute('demand', 'Канал продаж').then(attr => {
+        if (!attr?.meta?.href || !attr.customEntityMeta?.href) return null;
+        return msApiP('GET', hackerApiPath(attr.customEntityMeta.href)).then(customMeta => {
+            const valuesHref = customMeta.entityMeta?.href;
+            if (!valuesHref) return null;
+            return msApiP('GET', hackerApiPath(valuesHref)).then(values => {
+                const rows = values.rows || [];
+                const wanted = channelName || source?.value?.name || '';
+                const normalize = value => String(value || '').trim().toLowerCase();
+                const match = rows.find(row => normalize(row.name) === normalize(wanted))
+                    || rows.find(row => normalize(row.name).includes(normalize(wanted)) || normalize(wanted).includes(normalize(row.name)));
+                if (!match?.meta?.href) return null;
+                return {
+                    meta: hackerMetaRef(attr.meta.href, 'attributemetadata'),
+                    value: { meta: hackerMetaRef(match.meta.href, 'customentity') }
+                };
+            });
+        });
+    });
+}
+
+function hackerFetchAttrValues(entityType, attrName) {
+    return msApiP('GET', '/entity/' + entityType + '/metadata').then(meta => {
+        // В реальном ответе metadata.attributes — meta-ссылка, не массив.
+        const attrsRef = meta.attributes?.meta?.href;
+        const attrsPromise = attrsRef
+            ? msApiP('GET', hackerApiPath(attrsRef))
+            : Promise.resolve(meta.attributes);
+        return attrsPromise.then(attrsData => {
+            const rawAttrs = attrsData?.rows || attrsData;
+            const attrs = Array.isArray(rawAttrs)
+                ? rawAttrs
+                : (rawAttrs && typeof rawAttrs === 'object' ? Object.values(rawAttrs) : []);
+            const attr = attrs.find(a => a && a.name === attrName);
+            const customMetaHref = attr?.customEntityMeta?.href;
+            if (!customMetaHref) {
+                hackerLog(`Справочник «${attrName}» не найден в metadata ${entityType}`, 'warn');
+                return [];
+            }
+            // customEntityMeta — метаданные. Значения лежат по entityMeta.href.
+            return msApiP('GET', hackerApiPath(customMetaHref)).then(customMeta => {
+                const valuesHref = customMeta.entityMeta?.href;
+                if (!valuesHref) {
+                    hackerLog(`У справочника «${attrName}» нет ссылки на значения`, 'warn');
+                    return [];
+                }
+                return msApiP('GET', hackerApiPath(valuesHref)).then(values => {
+                    const rows = Array.isArray(values) ? values : (values.rows || []);
+                    return rows.map(r => ({ name: r.name, href: r.meta?.href }))
+                        .filter(r => r.href);
+                });
+            });
+        });
+    });
+}
+
+function hackerRefreshCashPayType() {
+    return hackerFetchAttrValues('cashin', HACKER_ATTR_PAY_TYPE).then(items => {
+        const cash = items.find(item => item.name === HACKER_CASH_PAY_NAME || /наличн/i.test(item.name));
+        return cash?.href || null;
+    });
+}
+
+function hackerRefreshClientStatuses(quiet) {
+    return hackerFetchAttrValues('cashin', HACKER_ATTR_CLIENT_STATUS)
+        .then(items => {
+            hackerClientStatuses = items;
+            hackerFillSelect(document.getElementById('hackerClientStatusSelect'), items, true);
+            if (!quiet) hackerLog(`«Статус клиента» обновлён: ${items.length} шт.`, 'ok');
+        })
+        .catch(error => hackerLog('Статус клиента: ' + error.message, 'err'));
+}
+
+function hackerRefreshPayMethods(quiet) {
+    return hackerFetchAttrValues('paymentin', HACKER_ATTR_PAY_METHOD)
+        .then(items => {
+            hackerPayMethods = items;
+            hackerFillSelect(document.getElementById('hackerPayMethodSelect'), items, true);
+            if (!quiet) hackerLog(`«Способ оплаты» обновлён: ${items.length} шт.`, 'ok');
+        })
+        .catch(error => hackerLog('Способ оплаты: ' + error.message, 'err'));
+}
+
+function hackerFetchCustomChannelValues() {
+    return hackerFetchMetadataAttribute('demand', 'Канал продаж').then(attr => {
+        if (!attr?.customEntityMeta?.href) return [];
+        return msApiP('GET', hackerApiPath(attr.customEntityMeta.href)).then(meta => {
+            const href = meta.entityMeta?.href;
+            return href ? msApiP('GET', hackerApiPath(href)) : { rows: [] };
+        }).then(data => (data.rows || []).map(row => ({
+            name: row.name,
+            href: row.meta?.href
+        })).filter(row => row.href));
+    });
+}
+
+function hackerRefreshSalesChannels(quiet) {
+    return Promise.all([
+        msApiP('GET', '/entity/saleschannel?limit=1000'),
+        hackerFetchCustomChannelValues()
+    ]).then(([data, customValues]) => {
+        const systems = data.rows || [];
+        hackerSalesChannels = systems.map(row => {
+            const custom = customValues.find(value => value.name === row.name);
+            return { name: row.name, href: row.meta?.href, customHref: custom?.href };
+        }).filter(row => row.href);
+        hackerFillSelect(document.getElementById('hackerChannelSelect'), hackerSalesChannels, true);
+        if (!quiet) hackerLog(`Каналы продаж обновлены: ${hackerSalesChannels.length} шт.`, 'ok');
+    }).catch(error => hackerLog('Каналы продаж: ' + error.message, 'err'));
+}
+
+// ─── Вкладка «Автопродажа» ────────────────────────────────────────────────────
+function hackerBuildSaleTab() {
+    const wrap = hackerEl('div');
+    wrap.id = 'hackerTabStatus_Sale';
+
+    const amountLabel = hackerEl('div', 'font-size:10px;font-weight:700;color:#64748b;margin-bottom:3px;', 'Сумма');
+    wrap.appendChild(amountLabel);
+    const amount = hackerEl('input');
+    amount.id = 'hackerSaleSum';
+    amount.type = 'text';
+    amount.placeholder = 'сумма, пусто/0 = не создавать';
+    amount.style.cssText = 'width:100%;padding:5px 7px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;outline:none;box-sizing:border-box;margin-bottom:7px;';
+    wrap.appendChild(amount);
+
+    const mkRow = (labelText, selectId, btnId) => {
+        const row = hackerEl('div', 'display:flex;gap:4px;margin-bottom:6px;');
+        const label = hackerEl('span', 'flex:0 0 145px;padding:5px 0;font-size:10px;font-weight:700;color:#64748b;', labelText);
+        row.appendChild(label);
+        row.appendChild(hackerSelect(selectId, '—'));
+        const btn = hackerBtn(btnId, '⟳', HACKER_MINI_BTN_CSS);
+        row.appendChild(btn);
+        wrap.appendChild(row);
+        return btn;
+    };
+    mkRow('Приходный — Статус клиента', 'hackerClientStatusSelect', 'hackerClientStatusRefresh')
+        .addEventListener('click', () => hackerRefreshClientStatuses(false));
+    mkRow('Входящий — Способ оплаты', 'hackerPayMethodSelect', 'hackerPayMethodRefresh')
+        .addEventListener('click', () => hackerRefreshPayMethods(false));
+
+    const cashLabel = hackerEl('div', 'font-size:10px;font-weight:700;color:#64748b;margin:2px 0 3px;', 'Наличные');
+    wrap.appendChild(cashLabel);
+    const cashAmount = hackerEl('input');
+    cashAmount.id = 'hackerCashAmount';
+    cashAmount.type = 'text';
+    cashAmount.placeholder = 'сумма наличными для кредита/рассрочки';
+    cashAmount.style.cssText = 'width:100%;padding:5px 7px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;outline:none;box-sizing:border-box;margin-bottom:7px;';
+    wrap.appendChild(cashAmount);
+
+    const lblChannel = hackerEl('div', 'font-size:10px;font-weight:700;color:#64748b;margin-bottom:3px;', 'Канал продаж');
+    wrap.appendChild(lblChannel);
+    const rowChannel = hackerEl('div', 'display:flex;gap:4px;margin-bottom:8px;');
+    const channelSel = hackerSelect('hackerChannelSelect', '— как в заказе / рандом —');
+    rowChannel.appendChild(channelSel);
+    const channelBtn = hackerBtn('hackerChannelRefresh', '⟳', HACKER_MINI_BTN_CSS);
+    channelBtn.addEventListener('click', () => hackerRefreshSalesChannels(false));
+    rowChannel.appendChild(channelBtn);
+    wrap.appendChild(rowChannel);
+
+    const actions = hackerEl('div', 'display:flex;gap:5px;flex-wrap:wrap;margin-top:4px;');
+    const demandBtn = hackerBtn('hackerCreateDemand', 'Создать отгрузку',
+        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#6366f1,#4f46e5);flex:1;');
+    demandBtn.addEventListener('click', hackerCreateDemand);
+    const cashinBtn = hackerBtn('hackerCreateCashin', 'Создать приходный ордер',
+        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#22c55e,#16a34a);flex:1;');
+    cashinBtn.addEventListener('click', hackerCreateCashin);
+    const payinBtn = hackerBtn('hackerCreatePaymentin', 'Создать входящий платёж',
+        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#f97316,#ea580c);flex:1;');
+    payinBtn.addEventListener('click', hackerCreatePaymentin);
+    const creditBtn = hackerBtn('hackerCreateCredit', 'Кредит/Рассрочка',
+        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#8b5cf6,#6d28d9);flex:1;');
+    creditBtn.addEventListener('click', hackerCreateCredit);
+    actions.appendChild(demandBtn);
+    actions.appendChild(cashinBtn);
+    actions.appendChild(payinBtn);
+    actions.appendChild(creditBtn);
+    wrap.appendChild(actions);
+    return wrap;
+}
+
+// ─── INVOKE: отгрузка + ПКО + входящий платёж ─────────────────────────────────
+function hackerBuildAttrBody(entityType, attrName, valueHref) {
+    if (!valueHref) return Promise.resolve(null);
+    return hackerFetchMetadataAttribute(entityType, attrName).then(attr => {
+        if (!attr) return null;
+        return {
+            meta: {
+                href: MS_API_BASE + '/entity/' + entityType + '/metadata/attributes/' + attr.id,
+                type: 'attributemetadata',
+                mediaType: 'application/json'
+            },
+            value: {
+                meta: {
+                    href: valueHref,
+                    type: 'customentity',
+                    mediaType: 'application/json'
+                }
+            }
+        };
+    });
+}
+
+function hackerMarkRequiredSelect(id, message) {
+    const el = document.getElementById(id);
+    if (el) {
+        el.style.borderColor = '#ef4444';
+        el.style.boxShadow = '0 0 0 2px #ef444433';
+        setTimeout(() => { if (el.isConnected) { el.style.borderColor = '#cbd5e1'; el.style.boxShadow = ''; } }, 2500);
+    }
+    hackerLog(message, 'warn');
+}
+
+function hackerSetActionBusy(busy) {
+    hackerBusy = busy;
+    ['hackerCreateDemand', 'hackerCreateCashin', 'hackerCreatePaymentin', 'hackerCreateCredit'].forEach(id => {
+        const button = document.getElementById(id);
+        if (button) { button.disabled = busy; button.style.opacity = busy ? '.6' : '1'; }
+    });
+}
+
+function hackerCurrentOrder() {
+    const doc = hackerOpenDoc();
+    if (!doc || !['customerorder', 'demand'].includes(doc.type)) {
+        hackerLog('Откройте карточку заказа или отгрузки', 'warn');
+        return null;
+    }
+    return doc;
+}
+
+async function hackerGetOrder() {
+    const doc = hackerCurrentOrder();
+    if (!doc) throw new Error('нет открытого заказа или отгрузки');
+    if (doc.type === 'demand') {
+        const demand = await msApiP('GET', '/entity/demand/' + doc.id + '?expand=customerOrder');
+        hackerLastDemand = demand;
+        return { doc, order: demand };
+    }
+    const order = hackerOrderInfo && hackerOrderInfo.id === doc.id
+        ? hackerOrderInfo
+        : await msApiP('GET', '/entity/customerorder/' + doc.id + '?expand=positions.assortment');
+    hackerOrderInfo = order;
+    return { doc, order };
+}
+
+async function hackerBuildDemandBody(order, doc) {
+    const demandBody = {
+        moment: order.moment,
+        organization: order.organization,
+        agent: order.agent,
+        store: order.store,
+        customerOrder: { meta: hackerMetaRef(MS_API_BASE + '/entity/customerorder/' + doc.id, 'customerorder') },
+        positions: (Array.isArray(order.positions) ? order.positions : (order.positions?.rows || [])).map(position => {
+            const copy = { assortment: position.assortment, quantity: position.quantity, price: position.price };
+            ['discount', 'vat', 'pack', 'things', 'reserve'].forEach(key => {
+                if (position[key] !== undefined) copy[key] = position[key];
+            });
+            return copy;
+        })
+    };
+    let channelHref = hackerDefaultChannel || document.getElementById('hackerChannelSelect')?.value || '';
+    let channelNote = hackerDefaultChannel ? 'по умолчанию' : 'как выбрано';
+    if (!channelHref && order.salesChannel?.meta?.href) {
+        channelHref = order.salesChannel.meta.href;
+        channelNote = 'как в заказе';
+    }
+    if (!channelHref) {
+        if (!hackerSalesChannels.length) await hackerRefreshSalesChannels(true);
+        const random = hackerSalesChannels[Math.floor(Math.random() * hackerSalesChannels.length)];
+        channelHref = random?.href || '';
+        channelNote = 'рандом';
+    }
+    const selected = hackerSalesChannels.find(item => item.href === channelHref);
+    if (!selected?.customHref) throw new Error('Для выбранного канала продаж не найдено значение атрибута отгрузки');
+    demandBody.salesChannel = { meta: hackerMetaRef(channelHref, 'saleschannel') };
+    const attr = await hackerFetchMetadataAttribute('demand', 'Канал продаж');
+    if (!attr?.meta?.href) throw new Error('В отгрузке не найден обязательный атрибут «Канал продаж»');
+    demandBody.attributes = [{
+        meta: hackerMetaRef(attr.meta.href, 'attributemetadata'),
+        value: { meta: hackerMetaRef(selected.customHref, 'customentity') }
+    }];
+    hackerLog(`Канал продаж отгрузки: ${channelNote}`);
+    hackerLog('Канал продаж продублирован в атрибут отгрузки');
+    return demandBody;
+}
+
+function hackerPositionKey(position) {
+    return position.assortment?.meta?.href || position.assortment?.id || '';
+}
+
+function hackerPositionsSignature(document) {
+    const rows = Array.isArray(document?.positions)
+        ? document.positions
+        : (document?.positions?.rows || []);
+    return rows
+        .map(position => `${hackerPositionKey(position)}:${Number(position.quantity || 0)}`)
+        .sort()
+        .join('|');
+}
+
+async function hackerFindExistingDemand(order, doc) {
+    const customerOrderHref = MS_API_BASE + '/entity/customerorder/' + doc.id;
+    const path = '/entity/demand?filter=customerOrder=' + encodeURIComponent(customerOrderHref)
+        + '&expand=positions.assortment&limit=100';
+    const data = await msApiP('GET', path);
+    const rows = data.rows || [];
+    const orderSum = Number(order.sum || 0);
+    const orderPositions = hackerPositionsSignature(order);
+    return rows.filter(demand => demand.applicable === true && Number(demand.sum || 0) === orderSum)
+        .map(demand => ({
+            demand,
+            samePositions: hackerPositionsSignature(demand) === orderPositions
+        }));
+}
+
+async function hackerCreateDemand() {
+    if (hackerBusy) return;
+    const current = hackerOpenDoc();
+    if (!current || current.type !== 'customerorder') {
+        hackerLog('Для создания отгрузки откройте заказ покупателя', 'warn');
+        return;
+    }
+    hackerSetActionBusy(true);
+    try {
+        const { doc, order } = await hackerGetOrder();
+        const existing = await hackerFindExistingDemand(order, doc);
+        const exact = existing.find(item => item.samePositions);
+        if (exact) {
+            hackerLastDemand = exact.demand;
+            hackerLog(`⚠️ Уже есть проведённая отгрузка ${exact.demand.name} на сумму ${(exact.demand.sum / 100).toFixed(2)} ₽ — новая не создаётся`, 'warn');
+            return;
+        }
+        if (existing.length) {
+            hackerLog('Есть проведённая отгрузка с такой же суммой, но состав позиций отличается — создаю новую отгрузку', 'warn');
+        }
+        hackerLog('Создаю отгрузку…');
+        hackerOrderInfo = order;
+        const demand = await hackerPostWithNameRetry('demand', await hackerBuildDemandBody(order, doc), order.name || ('Автопродажа ' + doc.id));
+        hackerLastDemand = demand;
+        hackerLog(`✅ Отгрузка создана: ${demand.name}`, 'ok');
+        location.hash = '#demand/edit?id=' + demand.id;
+    } catch (error) { hackerLog('Отгрузка: ' + (error.message || error), 'err'); }
+    finally { hackerSetActionBusy(false); }
+}
+
+async function hackerCreatePaymentDocument(entityType) {
+    const sum = hackerParseSumToKopecks(document.getElementById('hackerSaleSum')?.value);
+    if (!sum) { hackerLog(`${entityType === 'cashin' ? 'Приходный ордер' : 'Входящий платёж'}: сумма пустая/0 — пропущен`); return; }
+    const { doc, order } = await hackerGetOrder();
+    const demand = hackerLastDemand;
+    const body = { organization: order.organization, agent: order.agent, sum, moment: order.moment };
+    const linkedDocument = demand?.id
+        ? { id: demand.id, type: 'demand', label: 'отгрузке' }
+        : (doc.type === 'customerorder'
+            ? { id: doc.id, type: 'customerorder', label: 'заказу' }
+            : { id: doc.id, type: 'demand', label: 'отгрузке' });
+    body.operations = [{
+        meta: hackerMetaRef(MS_API_BASE + '/entity/' + linkedDocument.type + '/' + linkedDocument.id, linkedDocument.type),
+        linkedSum: sum
+    }];
+    hackerLog(`Документ будет привязан к ${linkedDocument.label}`);
+    if (entityType === 'cashin') {
+        const clientHref = document.getElementById('hackerClientStatusSelect')?.value || '';
+        const cashTypeHref = await hackerRefreshCashPayType();
+        body.attributes = [
+            await hackerBuildAttrBody('cashin', HACKER_ATTR_CLIENT_STATUS, clientHref),
+            await hackerBuildAttrBody('cashin', HACKER_ATTR_PAY_TYPE, cashTypeHref)
+        ].filter(Boolean);
+    } else {
+        const methodHref = document.getElementById('hackerPayMethodSelect')?.value || '';
+        if (!methodHref) { hackerMarkRequiredSelect('hackerPayMethodSelect', 'Выберите «Способ оплаты»'); return; }
+        body.attributes = [await hackerBuildAttrBody('paymentin', HACKER_ATTR_PAY_METHOD, methodHref)].filter(Boolean);
+    }
+    return hackerPostWithNameRetry(entityType, body, order.name || ('Автопродажа ' + order.id));
+}
+
+async function hackerCreateCashin() {
+    if (hackerBusy) return; hackerSetActionBusy(true);
+    try { const item = await hackerCreatePaymentDocument('cashin'); if (item) hackerLog(`✅ Приходный ордер создан: ${item.name}`, 'ok'); }
+    catch (error) { hackerLog('Приходный ордер: ' + (error.message || error), 'err'); }
+    finally { hackerSetActionBusy(false); }
+}
+
+async function hackerCreateCredit() {
+    if (hackerBusy) return;
+    const total = hackerParseSumToKopecks(document.getElementById('hackerSaleSum')?.value);
+    const cash = hackerParseSumToKopecks(document.getElementById('hackerCashAmount')?.value);
+    if (!total || !cash) { hackerLog('Для кредита/рассрочки укажите общую сумму и сумму наличными', 'warn'); return; }
+    if (cash >= total) { hackerLog('Сумма наличными должна быть меньше общей суммы', 'warn'); return; }
+    const rest = total - cash;
+    hackerSetActionBusy(true);
+    try {
+        const amountInput = document.getElementById('hackerSaleSum');
+        const oldAmount = amountInput.value;
+        amountInput.value = String(cash / 100);
+        const cashDoc = await hackerCreatePaymentDocument('cashin');
+        amountInput.value = oldAmount;
+        if (cashDoc) hackerLog(`✅ ПКО на наличные создан: ${cashDoc.name}`, 'ok');
+        amountInput.value = String(rest / 100);
+        const payDoc = await hackerCreatePaymentDocument('paymentin');
+        amountInput.value = oldAmount;
+        if (payDoc) hackerLog(`✅ Входящий платёж на остаток создан: ${payDoc.name}`, 'ok');
+    } catch (error) { hackerLog('Кредит/рассрочка: ' + (error.message || error), 'err'); }
+    finally { hackerSetActionBusy(false); }
+}
+
+async function hackerCreatePaymentin() {
+    if (hackerBusy) return; hackerSetActionBusy(true);
+    try { const item = await hackerCreatePaymentDocument('paymentin'); if (item) hackerLog(`✅ Входящий платёж создан: ${item.name}`, 'ok'); }
+    catch (error) { hackerLog('Входящий платёж: ' + (error.message || error), 'err'); }
+    finally { hackerSetActionBusy(false); }
+}
+
+// Старый общий сценарий оставлен для совместимости с сохранёнными dev-сборками.
+function hackerInvokeAutosale() {
+    if (hackerBusy) { hackerLog('Уже выполняется…', 'warn'); return; }
+    const doc = hackerOpenDoc();
+    if (!doc || doc.type !== 'customerorder') {
+        hackerLog('Откройте карточку заказа покупателя', 'warn');
+        return;
+    }
+    const cashinSum = hackerParseSumToKopecks(document.getElementById('hackerCashinSum')?.value);
+    const payinSum = hackerParseSumToKopecks(document.getElementById('hackerPayinSum')?.value);
+    const clientStatusHref = document.getElementById('hackerClientStatusSelect')?.value || '';
+    const payMethodHref = document.getElementById('hackerPayMethodSelect')?.value || '';
+    const channelChoice = document.getElementById('hackerChannelSelect')?.value || '';
+    if (payinSum > 0 && !payMethodHref) {
+        hackerMarkRequiredSelect('hackerPayMethodSelect', 'Выберите «Способ оплаты» для входящего платежа');
+        return;
+    }
+    const cashPayTypeHrefPromise = cashinSum > 0 ? hackerRefreshCashPayType() : Promise.resolve(null);
+
+    hackerBusy = true;
+    const invokeBtn = document.getElementById('hackerInvoke');
+    if (invokeBtn) { invokeBtn.disabled = true; invokeBtn.style.opacity = '.6'; }
+
+    const finish = () => {
+        hackerBusy = false;
+        if (invokeBtn) { invokeBtn.disabled = false; invokeBtn.style.opacity = '1'; }
+    };
+
+    (async () => {
+        try {
+            hackerLog('INVOKE: запускаю…');
+            // 1. Заказ (свежая копия — для agent/org/store/канала)
+            const order = hackerOrderInfo && hackerOrderInfo.id === doc.id
+                ? hackerOrderInfo
+                : await msApiP('GET', '/entity/customerorder/' + doc.id + '?expand=positions.assortment');
+            hackerOrderInfo = order;
+            const orderSum = order.sum || 0;
+
+            // 2. Отгрузка из заказа: MS сам создаст позиции и связи
+            hackerLog('Создаю отгрузку…');
+            const demandBody = {
+                moment: order.moment,
+                organization: order.organization,
+                agent: order.agent,
+                store: order.store,
+                customerOrder: {
+                    meta: {
+                        href: MS_API_BASE + '/entity/customerorder/' + doc.id,
+                        type: 'customerorder'
+                    }
+                },
+                // API не переносит позиции одной ссылкой на заказ — передаём их явно.
+                positions: (Array.isArray(order.positions)
+                    ? order.positions
+                    : (order.positions?.rows || [])).map(position => {
+                    const copy = {
+                        assortment: position.assortment,
+                        quantity: position.quantity,
+                        price: position.price
+                    };
+                    ['discount', 'vat', 'pack', 'things', 'reserve'].forEach(key => {
+                        if (position[key] !== undefined) copy[key] = position[key];
+                    });
+                    return copy;
+                })
+            };
+            // Канал продаж: выбранное значение, иначе — как в заказе, иначе — рандом из справочника
+            let channelHref = channelChoice;
+            let channelNote = 'как выбрано';
+            if (!channelHref && order.salesChannel && order.salesChannel.meta) {
+                channelHref = order.salesChannel.meta.href;
+                channelNote = 'как в заказе';
+            }
+            if (!channelHref) {
+                if (!hackerSalesChannels.length) await hackerRefreshSalesChannels(true);
+                if (hackerSalesChannels.length) {
+                    channelHref = hackerSalesChannels[Math.floor(Math.random() * hackerSalesChannels.length)].href;
+                    channelNote = 'рандом';
+                }
+            }
+            if (channelHref) {
+                demandBody.salesChannel = {
+                    meta: hackerMetaRef(channelHref, 'saleschannel')
+                };
+                hackerLog(`Канал продаж отгрузки: ${channelNote}`);
+            }
+
+            // В карточке отгрузки канал встречается и как системное поле salesChannel,
+            // и как пользовательский атрибут «Канал продаж». Копируем оба значения.
+            const selectedChannel = hackerSalesChannels.find(item => item.href === channelHref);
+            const channelName = selectedChannel?.name || order.salesChannel?.name || '';
+            if (!selectedChannel?.customHref) {
+                throw new Error('Для выбранного канала продаж не найдено значение атрибута отгрузки');
+            }
+            const demandChannelAttr = await hackerFetchMetadataAttribute('demand', 'Канал продаж');
+            if (!demandChannelAttr?.meta?.href) {
+                throw new Error('В отгрузке не найден обязательный атрибут «Канал продаж»');
+            }
+            demandBody.attributes = [{
+                meta: hackerMetaRef(demandChannelAttr.meta.href, 'attributemetadata'),
+                value: { meta: hackerMetaRef(selectedChannel.customHref, 'customentity') }
+            }];
+            hackerLog('Канал продаж продублирован в атрибут отгрузки');
+
+            const demandName = order.name || ('Автопродажа ' + doc.id);
+            const demand = await hackerPostWithNameRetry('demand', demandBody, demandName);
+            hackerLog(`✅ Отгрузка создана: ${demand.name}`, 'ok');
+
+            // 3. ПКО (приходный ордер) — если сумма > 0
+            if (cashinSum > 0) {
+                const cashinBody = {
+                    organization: order.organization,
+                    agent: order.agent,
+                    sum: cashinSum,
+                    operations: [{
+                        meta: {
+                            href: MS_API_BASE + '/entity/demand/' + demand.id,
+                            type: 'demand',
+                            mediaType: 'application/json'
+                        },
+                        linkedSum: cashinSum
+                    }]
+                };
+                const clientAttrBody = await hackerBuildAttrBody('cashin', HACKER_ATTR_CLIENT_STATUS, clientStatusHref);
+                const cashPayTypeHref = await cashPayTypeHrefPromise;
+                const payTypeAttrBody = await hackerBuildAttrBody('cashin', HACKER_ATTR_PAY_TYPE, cashPayTypeHref);
+                cashinBody.attributes = [clientAttrBody, payTypeAttrBody].filter(Boolean);
+                const cashin = await hackerPostWithNameRetry('cashin', cashinBody, demandName);
+                hackerLog(`✅ Приходный ордер создан: ${cashin.name} (${(cashinSum / 100).toFixed(2)} ₽)`, 'ok');
+            } else {
+                hackerLog('Приходный ордер: сумма пустая/0 — пропущен');
+            }
+
+            // 4. Входящий платёж — если сумма > 0
+            if (payinSum > 0) {
+                const payinBody = {
+                    organization: order.organization,
+                    agent: order.agent,
+                    sum: payinSum,
+                    operations: [{
+                        meta: {
+                            href: MS_API_BASE + '/entity/demand/' + demand.id,
+                            type: 'demand',
+                            mediaType: 'application/json'
+                        },
+                        linkedSum: payinSum
+                    }]
+                };
+                const attrBody = await hackerBuildAttrBody('paymentin', HACKER_ATTR_PAY_METHOD, payMethodHref);
+                if (attrBody) payinBody.attributes = [attrBody];
+                const payin = await hackerPostWithNameRetry('paymentin', payinBody, demandName);
+                hackerLog(`✅ Входящий платёж создан: ${payin.name} (${(payinSum / 100).toFixed(2)} ₽)`, 'ok');
+            } else {
+                hackerLog('Входящий платёж: сумма пустая/0 — пропущен');
+            }
+
+            // 5. Открываем отгрузку
+            hackerLog('Открываю отгрузку…', 'ok');
+            location.hash = '#demand/edit?id=' + demand.id;
+        } catch (error) {
+            hackerLog('INVOKE: ' + (error.message || error), 'err');
+        } finally {
+            finish();
+        }
+    })();
+}
+
+async function hackerCheckOrderSum() {
+    try {
+        const { order } = await hackerGetOrder();
+        const sum = ((order.sum || 0) / 100).toFixed(2);
+        ['hackerSaleSum', 'hackerCashAmount'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el && id === 'hackerSaleSum') el.value = sum;
+        });
+        hackerLog(`✅ Сумма заказа обновлена: ${sum} ₽`, 'ok');
+    } catch (error) {
+        hackerLog('Проверка суммы: ' + (error.message || error), 'err');
+    }
+}
+
+function hackerParseSumToKopecks(value) {
+    const n = parseFloat(String(value || '').replace(',', '.').replace(/\s/g, ''));
+    return (isFinite(n) && n > 0) ? Math.round(n * 100) : 0;
 }
 
 // ─── Production entrypoint ───────────────────────────────────────────────────
