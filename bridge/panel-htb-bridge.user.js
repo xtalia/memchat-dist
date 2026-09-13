@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Panel Hatiko Bridge
 // @namespace    http://tampermonkey.net/
-// @version      0.1.0
+// @version      0.2.0
 // @description  Отдаёт CSRF-токен Panel Hatiko основному скрипту Мемного чата через postMessage
 // @match        https://panel.hatiko.ru/*
 // @grant        none
@@ -55,13 +55,21 @@
         }
     }
 
-    window.addEventListener('message', (event) => {
-        if (!event.data || event.data.source !== 'memchat-main' || event.data.type !== 'panel-token-request') return;
-        if (!isAllowedOrigin(event.origin)) { console.warn('[PanelBridge] blocked origin', event.origin); return; }
-        sendResponse(event.origin);
+    function pushToken() {
+        if (document.hidden) return;
+        sendResponse();
+    }
+
+    // Push-модель: не ждём запрос от основного скрипта. Пока вкладка Panel
+    // активна, обновляем токен каждые 5 минут; при возвращении во вкладку
+    // отправляем свежий токен сразу.
+    window.addEventListener('visibilitychange', () => {
+        if (!document.hidden) pushToken();
     });
+    setInterval(pushToken, 5 * 60 * 1000);
 
     if (window === window.top) {
-        console.info('[PanelBridge] готов. Отправляю токен по запросу из Мемного чата.');
+        console.info('[PanelBridge] готов. Push-обновление CSRF каждые 5 минут.');
+        pushToken();
     }
 })();

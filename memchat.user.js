@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      7.7.0-beta
+// @version      8.0.0-beta
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '7.7.0-beta';
+const MEMCHAT_VERSION = '8.0.0-beta';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -102,6 +102,10 @@ let clearTextEnabled = false;
 let globalClearKeypressBound = false;
 let calcRules     = [];
 let scheduleReplacements = {};
+let scheduleStateByDay = {
+    today: { loading: false, parsed: null, textCopy: '', error: '', updatedAt: 0 },
+    tomorrow: { loading: false, parsed: null, textCopy: '', error: '', updatedAt: 0 }
+};
 let currentHatikoPathname = '';
 let lastHatikoResults = [];
 let lastHatikoQuery = '';
@@ -114,6 +118,30 @@ let hackerBearerToken = '';
 let hackerApiValidated = false;
 let hackerDefaultChannel = '';
 let hackerQuickButtonsEnabled = true;
+// Экспериментальные API-кнопки создания документов временно скрыты.
+// Рабочая панель, нажимающая штатные пункты меню МойСклад, остаётся включённой.
+const HACKER_QUICK_API_ROW_ENABLED = false;
+
+// 🪄 Правила заполнения штатных карточек документов МойСклад. Пустые обязательные
+// значения пользователь выбирает в окне палочки перед сохранением документа.
+const DEFAULT_MS_MAGIC_CONFIG = {
+    demand: {
+        copies: [{ field: 'Канал продаж', from: 0, to: [1], required: true }],
+        values: []
+    },
+    cashin: {
+        copies: [],
+        values: [
+            { field: 'Тип оплаты', value: 'Наличными', required: true },
+            { field: 'Статус клиента', value: '', required: true }
+        ]
+    },
+    paymentin: {
+        copies: [],
+        values: [{ field: 'Способ оплаты', value: '', required: true }]
+    }
+};
+let msMagicConfig = JSON.parse(JSON.stringify(DEFAULT_MS_MAGIC_CONFIG));
 
 // ─── Скрытие полей МойСклад ──────────────────────────────────────────────────
 let hiddenFields = [];        // имена полей (точный текст лейбла), прячемых на МойСклад
@@ -465,23 +493,23 @@ function ensurePanelCsrf(onSuccess, onError, force = false, viaBridgeOnly = fals
     if (force) { refreshPanelCsrf(onSuccess, onError); return; }
     const cached = loadPanelCsrf();
     if (cached) { onSuccess(cached); return; }
-    // Сначала bridge (токен из живой вкладки Panel), затем прямой с retry
-    requestPanelCsrfViaBridge(token => onSuccess(token), () => {
-        refreshPanelCsrf(onSuccess, error => {
-            openPanelInBackground();
-            onError?.(error);
-        });
+    // Bridge работает push-моделью: если токен уже пришёл — используем его.
+    // Не ждём ответ на postMessage: это убирает задержку до 4 секунд при
+    // закрытой/неактивной вкладке Panel. При отсутствии кэша идём напрямую.
+    refreshPanelCsrf(onSuccess, error => {
+        openPanelInBackground();
+        onError?.(error);
     });
 }
 
 function schedulePanelCsrfRefresh() {
     if (panelCsrfRefreshing || typeof setInterval === 'undefined') return;
     panelCsrfRefreshing = true;
+    // Проверяем кэш чаще, но сам токен обновляем только по TTL.
     setInterval(() => {
-        if (loadPanelCsrf()) {
-            refreshPanelCsrf(() => {}, () => { clearPanelCsrf(); });
-        }
-    }, PANEL_CSRF_REFRESH_INTERVAL_MS);
+        if (loadPanelCsrf()) return;
+        refreshPanelCsrf(() => {}, () => { clearPanelCsrf(); });
+    }, 60 * 1000);
 }
 
 function panelRequest(path, options, onSuccess, onError) {
@@ -555,7 +583,7 @@ function panelSearch(query, onSuccess, onError) {
     }, (error, response) => {
         if ((response?.status === 419 || response?.status === 401 || response?.status === 403) && !retried) {
             clearPanelCsrf();
-            requestPanelCsrfViaBridge(newCsrf => attempt(newCsrf, true), () => refreshPanelCsrf(newCsrf => attempt(newCsrf, true), () => onError(new Error('Panel: авторизация истекла. Войдите в panel.hatiko.ru.'))));
+            refreshPanelCsrf(newCsrf => attempt(newCsrf, true), () => onError(new Error('Panel: авторизация истекла. Войдите в panel.hatiko.ru.')));
             return;
         }
         onError(error);
@@ -577,7 +605,7 @@ function panelCheckBonuses(phone, onSuccess, onError) {
     }, (error, response) => {
         if ((response?.status === 419 || response?.status === 401 || response?.status === 403) && !retried) {
             clearPanelCsrf();
-            requestPanelCsrfViaBridge(newCsrf => attempt(newCsrf, true), () => refreshPanelCsrf(newCsrf => attempt(newCsrf, true), () => onError(new Error('Panel: авторизация истекла. Войдите в panel.hatiko.ru.'))));
+            refreshPanelCsrf(newCsrf => attempt(newCsrf, true), () => onError(new Error('Panel: авторизация истекла. Войдите в panel.hatiko.ru.')));
             return;
         }
         onError(error);
@@ -1082,47 +1110,70 @@ function calculateSimple() {
 /* ===== 06-schedule.js ===== */
 
 // ─── Расписание ───────────────────────────────────────────────────────────────
-// Вкладки «Сегодня»/«Завтра» открывают модальное окно с таблицей «Кто/Где».
-function fetchWhoWorksToday()    { fetchWhoWorks('today'); }
-function fetchWhoWorksTomorrow() { fetchWhoWorks('tomorrow'); }
+// Вкладки «Сегодня»/«Завтра» показывают данные внутри Мемного чата.
+function fetchWhoWorksToday()    { return fetchWhoWorks('today'); }
+function fetchWhoWorksTomorrow() { return fetchWhoWorks('tomorrow'); }
 
 function fetchWhoWorks(day) {
     const url     = `https://docs.google.com/spreadsheets/d/13KUmHtRXYbXjBE7KQ_4MFQ5VsgUYqu2heURY1y2NwiE/edit`;
     const jsonUrl = 'https://github.com/xtalia/hatiko/raw/refs/heads/main/js/wwPeoples.json';
+    const state = scheduleStateByDay[day];
+    if (!state || state.loading) return Promise.resolve(null);
+    state.loading = true;
+    state.error = '';
+    renderScheduleTab(day);
 
-    fetch(jsonUrl)
+    return fetch(jsonUrl)
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
         .then(loaded => loadTableWithReplacements(day, url, { ...scheduleReplacements, ...loaded }))
-        .catch(()    => loadTableWithReplacements(day, url, scheduleReplacements));
+        .catch(() => loadTableWithReplacements(day, url, scheduleReplacements))
+        .then(result => {
+            state.loading = false;
+            state.parsed = result.parsed;
+            state.textCopy = result.textCopy;
+            state.error = '';
+            state.updatedAt = Date.now();
+            renderScheduleTab(day);
+            return result;
+        })
+        .catch(error => {
+            state.loading = false;
+            state.error = error.message || 'Ошибка сети при загрузке расписания';
+            renderScheduleTab(day);
+            return null;
+        });
 }
 
 function loadTableWithReplacements(day, url, replacements) {
-    GM_xmlhttpRequest({
-        method: 'GET', url,
+    return new Promise((resolve, reject) => GM_xmlhttpRequest({
+        method: 'GET',
+        url,
         onload(response) {
-            const regex = /🎯РАБОЧИЙ_ГРАФИК_ДАННЫЕ🎯([\s\S]*?)🎯/i;
-            const match = response.responseText.match(regex);
-            if (!match?.[1]) { openScheduleTableWindow(day, null, 'Не удалось найти данные в таблице'); return; }
+            try {
+                const regex = /🎯РАБОЧИЙ_ГРАФИК_ДАННЫЕ🎯([\s\S]*?)🎯/i;
+                const match = response.responseText.match(regex);
+                if (!match?.[1]) throw new Error('Не удалось найти данные в таблице');
 
-            const tmp = document.createElement('div');
-            tmp.innerHTML = match[1];
-            let full = (tmp.textContent || '').trim().replace(/\s+/g, ' ');
-
-            const markers = {
-                today:    ['📅СЕГОДНЯ_НАЧАЛО📅', '📅СЕГОДНЯ_КОНЕЦ📅'],
-                tomorrow: ['📅ЗАВТРА_НАЧАЛО📅',   '📅ЗАВТРА_КОНЕЦ📅']
-            };
-            const [sm, em] = markers[day];
-            const si = full.indexOf(sm), ei = full.indexOf(em);
-            if (si === -1 || ei === -1) { openScheduleTableWindow(day, null, 'Данные не найдены'); return; }
-
-            let text = full.substring(si, ei).replace(sm, '').replace(em, '').trim();
-            const parsed = parseScheduleLines(text, replacements, day);
-            const textCopy = formatOutputWithReplacements(text, replacements, day);
-            openScheduleTableWindow(day, parsed, textCopy);
+                const parsedHtml = new DOMParser().parseFromString(match[1], 'text/html');
+                const full = (parsedHtml.body.textContent || '').trim().replace(/\s+/g, ' ');
+                const markers = {
+                    today:    ['📅СЕГОДНЯ_НАЧАЛО📅', '📅СЕГОДНЯ_КОНЕЦ📅'],
+                    tomorrow: ['📅ЗАВТРА_НАЧАЛО📅', '📅ЗАВТРА_КОНЕЦ📅']
+                };
+                const [sm, em] = markers[day];
+                const si = full.indexOf(sm), ei = full.indexOf(em);
+                if (si === -1 || ei === -1) throw new Error('Данные не найдены');
+                const text = full.substring(si, ei).replace(sm, '').replace(em, '').trim();
+                resolve({
+                    parsed: parseScheduleLines(text, replacements, day),
+                    textCopy: formatOutputWithReplacements(text, replacements, day)
+                });
+            } catch (error) {
+                reject(error);
+            }
         },
-        onerror() { openScheduleTableWindow(day, null, 'Ошибка сети при загрузке расписания'); }
-    });
+        onerror() { reject(new Error('Ошибка сети при загрузке расписания')); }
+    }));
 }
 
 // Разбирает расписание на группы по городам. Вход — «почти одна строка» с
@@ -1164,6 +1215,69 @@ function parseScheduleLines(text, replacements, day) {
     });
 
     return { dateStr, groups };
+}
+
+function renderScheduleTab(day) {
+    const pane = document.getElementById('mcSpecialPane');
+    if (!pane || currentAction !== day) return;
+    const state = scheduleStateByDay[day];
+    const dayName = day === 'today' ? 'Сегодня' : 'Завтра';
+    pane.replaceChildren();
+
+    const toolbar = document.createElement('div');
+    toolbar.style.cssText = 'display:flex;align-items:center;gap:6px;flex:0 0 auto;';
+    const title = document.createElement('strong');
+    title.textContent = `${day === 'today' ? '🟢' : '🟡'} ${dayName}${state.parsed?.dateStr ? ` — ${state.parsed.dateStr}` : ''}`;
+    title.style.cssText = 'flex:1;color:#334155;font-size:12px;';
+    toolbar.appendChild(title);
+    const refresh = document.createElement('button');
+    refresh.type = 'button';
+    refresh.className = 'mc-btn mc-btn-blue';
+    refresh.textContent = state.loading ? '⏳' : '↻ Обновить';
+    refresh.disabled = state.loading;
+    refresh.addEventListener('click', () => fetchWhoWorks(day));
+    toolbar.appendChild(refresh);
+    pane.appendChild(toolbar);
+
+    const meta = document.createElement('div');
+    meta.style.cssText = 'font-size:9.5px;color:#94a3b8;';
+    meta.textContent = state.updatedAt
+        ? `Обновлено ${new Date(state.updatedAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })}${state.error ? ' · данные могут быть устаревшими' : ''}`
+        : 'Нажмите «Обновить», чтобы загрузить расписание';
+    pane.appendChild(meta);
+
+    const list = document.createElement('div');
+    list.style.cssText = 'flex:1 1 auto;overflow-y:auto;min-height:80px;';
+    if (state.error) {
+        const error = document.createElement('div');
+        error.className = 'mc-overlay-error';
+        error.textContent = state.error;
+        list.appendChild(error);
+    }
+    if (state.parsed?.groups?.length) {
+        state.parsed.groups.forEach(group => {
+            const city = document.createElement('div');
+            city.className = 'mc-sched-city';
+            city.textContent = `🏙 ${group.city}`;
+            list.appendChild(city);
+            group.rows.forEach(item => {
+                const row = document.createElement('div');
+                row.className = 'mc-sched-row';
+                row.textContent = `👤 ${item.person} — ${item.store}`;
+                list.appendChild(row);
+            });
+        });
+    }
+    pane.appendChild(list);
+
+    if (state.textCopy) {
+        const copy = document.createElement('button');
+        copy.type = 'button';
+        copy.className = 'mc-btn mc-btn-slate';
+        copy.textContent = '📋 Копировать';
+        copy.addEventListener('click', () => copyHatikoText(state.textCopy));
+        pane.appendChild(copy);
+    }
 }
 
 // Плавающее перетаскиваемое окно со списком «Кто/Где» (без затемнения).
@@ -1824,9 +1938,10 @@ function buildMsQuickPanel() {
     const oldWrap = document.querySelector('[data-mc-quick-wrap]');
     const oldQuickRow = document.getElementById('mcHackerQuickRow');
     const kind = Object.keys(MS_QUICK_PANEL_CONFIG).find(k => MS_QUICK_PANEL_CONFIG[k].marker());
-    // Keep a complete pair stable across MutationObserver callbacks. Rebuilding
-    // on every insertion would make the observer duplicate both rows forever.
-    if (old && old.dataset.kind === kind && old.isConnected && oldQuickRow?.isConnected) return;
+    const quickEnabled = HACKER_QUICK_API_ROW_ENABLED && hackerQuickButtonsEnabled;
+    // Keep a complete pair stable across MutationObserver callbacks.
+    if (old && old.dataset.kind === kind && old.isConnected
+        && (!quickEnabled || oldQuickRow?.isConnected)) return;
     if (oldQuickRow) oldQuickRow.remove();
     if (!kind || !msQuickPanelEnabled) { if (oldWrap) oldWrap.remove(); else if (old) old.remove(); return; }
 
@@ -1843,7 +1958,7 @@ function buildMsQuickPanel() {
     }
     if (!bar || bar === document.body) return;
 
-    if (!hackerQuickButtonsEnabled) { document.getElementById('mcHackerQuickRow')?.remove(); }
+    if (!quickEnabled) { document.getElementById('mcHackerQuickRow')?.remove(); }
     const panel = document.createElement('div');
     panel.id = 'mcQuickPanel';
     panel.dataset.kind = kind;
@@ -1895,7 +2010,7 @@ function buildMsQuickPanel() {
             td.appendChild(wrap);
             tr.appendChild(td);
             toolbarRow.after(tr);
-            if (!hackerQuickButtonsEnabled) return;
+            if (!quickEnabled) return;
             const quickTr = document.createElement('tr');
             const quickTd = document.createElement('td');
             quickTd.colSpan = toolbarRow.children.length || 1;
@@ -1916,7 +2031,7 @@ function buildMsQuickPanel() {
     if (!host) return;
     wrap.style.cssText = 'display:block;width:100%;';
     host.insertBefore(wrap, flexRow.nextSibling);
-    if (!hackerQuickButtonsEnabled) return;
+    if (!quickEnabled) return;
     const quickRow = buildMsHackerQuickRow(kind);
     quickRow.style.cssText += 'width:100%;';
     host.insertBefore(quickRow, wrap.nextSibling);
@@ -1934,9 +2049,7 @@ function setupGlobalClearTextFunctionality() {
     if (cb) {
         cb.checked = clearTextEnabled;
         cb.addEventListener('change', function () {
-            clearTextEnabled = this.checked;
-            localStorage.setItem('clearTextEnabled', clearTextEnabled);
-            updateClearTextButton();
+            setClearTextEnabled(this.checked);
         });
     }
     if (!globalClearKeypressBound) {
@@ -1951,18 +2064,29 @@ function setupGlobalClearTextFunctionality() {
     updateClearTextButton();
 }
 
+function setClearTextEnabled(enabled) {
+    clearTextEnabled = !!enabled;
+    localStorage.setItem('clearTextEnabled', String(clearTextEnabled));
+    const cb = document.getElementById('clearTextCheckbox');
+    if (cb) cb.checked = clearTextEnabled;
+    updateClearTextButton();
+}
+
 function updateClearTextButton() {
-    // Кнопка-индикатор убрана в 6.0.0 (очистка текста — чекбокс во вкладке «Настройки»).
-    const btn = document.getElementById('clearTextButton');
+    const btn = document.getElementById('mcClearTextToggle');
     if (!btn) return;
+    btn.setAttribute('aria-pressed', String(clearTextEnabled));
+    btn.dataset.tip = clearTextEnabled
+        ? '🧹 Очистка поля после Enter включена'
+        : '🧹 Очистка поля после Enter выключена';
     if (clearTextEnabled) {
-        btn.style.background = 'linear-gradient(135deg,#22c55e,#16a34a)';
-        btn.style.boxShadow  = '0 2px 8px #22c55e30';
-        btn.textContent = '🧹 Вкл';
+        btn.style.background = '#dcfce7';
+        btn.style.borderColor = '#22c55e';
+        btn.style.color = '#166534';
     } else {
-        btn.style.background = 'linear-gradient(135deg,#ef4444,#dc2626)';
-        btn.style.boxShadow  = '0 2px 8px #ef444430';
-        btn.textContent = '🧹 Выкл';
+        btn.style.background = '#f8fafc';
+        btn.style.borderColor = '#e2e8f0';
+        btn.style.color = '#64748b';
     }
 }
 
@@ -2067,15 +2191,17 @@ function createPriceCheckWindow() {
 
                         /* ── Вкладки ── */
                         #mcTabs {
-                            display: flex; gap: 4px; overflow-x: auto; flex-wrap: nowrap;
-                            padding-bottom: 2px;
+                            display: flex; flex: 0 0 auto; min-height: 32px; align-items: stretch;
+                            gap: 4px; overflow-x: auto; overflow-y: visible; flex-wrap: nowrap;
+                            padding: 1px 0 3px; box-sizing: border-box;
                         }
                         #mcTabs::-webkit-scrollbar { height: 3px; }
                         .mc-tab {
-                            flex: 0 0 auto;
-                            padding: 5px 8px; border: 1px solid #e2e8f0; border-radius: 8px;
+                            flex: 0 0 auto; min-height: 28px; height: 28px; box-sizing: border-box;
+                            display: inline-flex; align-items: center; justify-content: center;
+                            padding: 4px 8px; border: 1px solid #e2e8f0; border-radius: 8px;
                             background: #f8fafc; color: #475569; font-size: 11px; font-weight: 600;
-                            cursor: pointer; transition: all .15s ease; white-space: nowrap;
+                            line-height: 18px; cursor: pointer; transition: all .15s ease; white-space: nowrap;
                         }
                         .mc-tab:hover { border-color: #6366f1; color: #4f46e5; background: #eef2ff; }
                         .mc-tab-active {
@@ -2241,7 +2367,7 @@ function createPriceCheckWindow() {
             box-shadow:0 16px 46px rgba(15,23,42,.22), 0 0 0 1px rgba(255,255,255,.9);
             padding:14px; display:none; z-index:99999;
             box-sizing:border-box; flex-direction:column; gap:10px;
-            resize:both; overflow:hidden;
+            resize:both; overflow:auto;
         `;
 
         container.innerHTML = `
@@ -2277,14 +2403,17 @@ function createPriceCheckWindow() {
             <div id="mcTabs" role="tablist">
                 <button class="mc-tab" data-tab="checkHatiko" data-tip="🐶 Hatiko — поиск и цены">🐶</button>
                 <button class="mc-tab" data-tab="checkHatikoBonuses" data-tip="🎁 Бонусы — бонусы клиента">🎁</button>
+                <button class="mc-tab" data-tab="today" data-tip="🟢 Кто работает сегодня">🟢</button>
+                <button class="mc-tab" data-tab="tomorrow" data-tip="🟡 Кто работает завтра">🟡</button>
                 <button class="mc-tab" data-tab="calculator" data-tip="🧮 Калькулятор — расчёт кредита">🧮</button>
                 <button class="mc-tab" data-tab="calculator_reverse" data-tip="🔄 Реверс — обратный расчёт">🔄</button>
                 <button class="mc-tab" data-tab="calculator_discount" data-tip="🎉 Скидка — скидка и наценка">🎉</button>
                 <button class="mc-tab" data-tab="calculator_simple" data-tip="∑ Простой — простое выражение">∑</button>
+                <button class="mc-tab" data-tab="hacker" data-tip="🐱‍💻 ХатикоХакер" hidden>🐱‍💻</button>
             </div>
 
             <!-- ── Поле ввода ── -->
-            <div style="position:relative;">
+            <div id="mcInputRegion" style="position:relative;">
                 <input type="text" id="priceCheckInput" placeholder="Артикул, товар или сумма…">
                 <span style="
                     position:absolute;right:11px;top:50%;transform:translateY(-50%);
@@ -2300,12 +2429,12 @@ function createPriceCheckWindow() {
                             <div id="hatikoLinksPanel" class="mc-links-panel"></div>
                         </div>
 
+            <div id="mcSpecialPane" style="display:none;flex:1 1 auto;min-height:120px;flex-direction:column;gap:8px;overflow:hidden;"></div>
+
             <!-- ── Нижняя панель: статус + действия + настройки + очистка ── -->
                         <div id="mcBottomBar" style="flex:0 0 auto;display:flex;justify-content:flex-end;gap:6px;align-items:center;">
                             <span id="mcStatusBar" class="mc-status-bar">Наведите на кнопку…</span>
-                            <button id="mcActionToday" class="mc-action-btn" type="button" data-tip="👨‍💼 Кто работает сегодня">🟢📅</button>
-                            <button id="mcActionTomorrow" class="mc-action-btn" type="button" data-tip="📅 Кто работает завтра">🟡📅</button>
-                            <button id="mcActionHacker" class="mc-action-btn" type="button" data-tip="🐱‍👨‍💻 ХатикоХакер — будущие задачи">🐱‍👨‍💻</button>
+                            <button id="mcClearTextToggle" class="mc-action-btn" type="button" aria-pressed="false" data-tip="🧹 Очищать активное поле после Enter">🧹</button>
                             <button id="mcActionSettings" class="mc-action-btn" type="button" data-tip="⚙️ Настройки">⚙️</button>
                             <button id="mcClearChatButton" class="mc-btn-clear" type="button" data-tip="🗑 Очистить историю этой вкладки">🗑</button>
                         </div>
@@ -2314,8 +2443,9 @@ function createPriceCheckWindow() {
         document.body.appendChild(container);
         window.priceCheckContainer = container;
         document.getElementById('memchatVersion').textContent = `v${MEMCHAT_VERSION}${typeof MEMCHAT_BUILD !== 'undefined' ? `-${MEMCHAT_BUILD}` : ''}`;
-        hackerValidateApiKey(() => {});
+        hackerValidateApiKey(() => hackerSyncAccessUi());
         setupEventListeners();
+        updateClearTextButton();
         document.getElementById('hatikoReopenPickerButton').addEventListener('click', reopenHatikoProductPicker);
     }
 
@@ -2510,8 +2640,8 @@ function buildSettingsSnapshot() {
         clearTimeout: parseInt(document.getElementById('timeoutSlider')?.value || 500, 10),
         showHatikoLinks: loadShowHatikoLinks(),
         hatikoSearchMode,
-        hiddenFields: [...hiddenFields],
-        msQuickPanelEnabled
+        msQuickPanelEnabled,
+        msMagicConfig
     };
 }
 
@@ -2573,11 +2703,12 @@ function importSettings(jsonText) {
         if (sel) sel.value = data.hatikoSearchMode;
     }
     if (Array.isArray(data.hiddenFields)) {
-        hiddenFields = data.hiddenFields.filter(n => typeof n === 'string');
+        // Старые настройки выборочного скрытия больше не применяются: теперь
+        // дополнительные поля открываются единым спойлером штатного блока.
+        hiddenFields = [];
         saveHiddenFields();
-        if (!msFieldsRevealed) applyMsHiddenFields(); else restoreMsFields();
-        buildMsFieldsPanel();
-        updateMsRevealButton();
+        restoreMsFields();
+        document.getElementById('mcMsRevealBtn')?.remove();
     }
     if (typeof data.msQuickPanelEnabled === 'boolean') {
         msQuickPanelEnabled = data.msQuickPanelEnabled;
@@ -2585,6 +2716,16 @@ function importSettings(jsonText) {
         const cb = document.getElementById('msQuickPanelCheckbox');
         if (cb) cb.checked = msQuickPanelEnabled;
         buildMsQuickPanel();
+    }
+    if (data.msMagicConfig && typeof data.msMagicConfig === 'object') {
+        try {
+            saveMsMagicConfig(data.msMagicConfig);
+            const magicArea = document.getElementById('msMagicConfigJson');
+            if (magicArea) magicArea.value = JSON.stringify(msMagicConfig, null, 2);
+        } catch (error) {
+            setStatusText(`⚠️ JSON 🪄: ${error.message}`);
+            return false;
+        }
     }
 
     const area = document.getElementById('mcImportArea');
@@ -2595,7 +2736,47 @@ function importSettings(jsonText) {
     return true;
 }
 
-// ─── Окно «ХатикоХакер» (логика в 11-hacker.js) ───────────────────────────────
+function renderHackerInlineTab() {
+    const host = document.getElementById('mcSpecialPane');
+    if (!host || currentAction !== 'hacker') return;
+    host.replaceChildren();
+
+    const tabs = document.createElement('div');
+    tabs.id = 'hackerTabs';
+    tabs.style.cssText = 'display:flex;gap:4px;flex:0 0 auto;';
+    [['status', 'Статус'], ['agent', 'Контрагент'], ['sale', 'Автопродажа']].forEach(([key, label]) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = label;
+        btn.dataset.hackerTab = key;
+        btn.style.cssText = 'flex:1;padding:5px 4px;border:1px solid #e2e8f0;border-radius:8px;'
+            + 'background:#f8fafc;color:#475569;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;';
+        btn.addEventListener('click', () => hackerSelectTab(key));
+        tabs.appendChild(btn);
+    });
+    host.appendChild(tabs);
+
+    const panes = document.createElement('div');
+    panes.id = 'hackerTabPanes';
+    panes.style.cssText = 'flex:0 0 auto;';
+    host.appendChild(panes);
+
+    const logLabel = hackerEl('div', 'font-size:10px;font-weight:800;color:#64748b;text-transform:uppercase;'
+        + 'letter-spacing:.8px;margin-top:4px;', 'Консоль');
+    host.appendChild(logLabel);
+    const logBox = document.createElement('div');
+    logBox.id = 'hackerLogBox';
+    logBox.style.cssText = 'flex:1 1 auto;min-height:90px;overflow-y:auto;background:#0f172a;border-radius:10px;'
+        + 'padding:7px;font-size:10.5px;line-height:1.5;font-family:Consolas,monospace;';
+    host.appendChild(logBox);
+
+    hackerSelectTab(hackerTab);
+    hackerRenderLog();
+    hackerRefreshStates(true);
+    if (/online\.moysklad\.ru$/.test(location.hostname)) hackerLoadOpenOrder(true);
+}
+
+// ─── Окно «ХатикоХакер» (старый совместимый способ открытия) ──────────────────
 function openHackerWindow() {
     closeMemchatOverlay();
 
@@ -2777,20 +2958,16 @@ function openSettingsWindow() {
         <input type="text" id="msBearerToken" placeholder="API-ключ МойСклад (Bearer)…" spellcheck="false"
             style="display:none;width:100%;padding:5px 7px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;outline:none;box-sizing:border-box;margin-bottom:10px;">
 
-        <label style="display:block;color:#475569;font-size:12px;margin-bottom:8px;">
-            Канал продаж по умолчанию
-            <select id="hackerDefaultChannel" style="display:block;width:100%;margin-top:4px;padding:5px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;">
-                <option value="">Как в заказе / рандом</option>
-            </select>
-        </label>
-        <label style="display:flex;align-items:center;gap:8px;color:#475569;font-size:12px;margin-bottom:10px;cursor:pointer;">
-            <input type="checkbox" id="hackerQuickButtonsCheckbox" style="accent-color:#6366f1;width:14px;height:14px;">
-            Показывать ⚡-кнопки
-        </label>
-
-        <div style="height:8px;"></div>
-        <button id="msFieldsSettingsBtn" class="mc-btn mc-btn-slate" style="width:100%;">⚙️ Скрытые поля МойСклад</button>
-        <div id="msFieldsPanel" class="mc-panel" style="display:none;max-height:none;"></div>
+        <button id="msMagicSettingsBtn" class="mc-btn mc-btn-slate" style="width:100%;">🪄 Автозаполнение документов (JSON)</button>
+        <div id="msMagicSettingsPanel" class="mc-panel" style="display:none;max-height:none;">
+            <div style="font-size:10.5px;color:#64748b;margin-bottom:6px;line-height:1.4;">
+                demand — Отгрузка, cashin — Приходный ордер, paymentin — Входящий платёж.<br>
+                copies копирует значение между одинаковыми полями; values задаёт точное значение из списка МойСклад.
+            </div>
+            <textarea id="msMagicConfigJson" spellcheck="false" style="width:100%;height:210px;padding:7px;box-sizing:border-box;resize:vertical;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#334155;font:10px Consolas,monospace;"></textarea>
+            <button id="msMagicConfigSave" class="mc-btn mc-btn-green" style="width:100%;margin-top:6px;">Сохранить JSON</button>
+            <div id="msMagicConfigStatus" style="min-height:16px;margin-top:5px;font-size:10.5px;color:#64748b;"></div>
+        </div>
 
         <div style="height:8px;"></div>
         <button id="resetFloatPosBtn" class="mc-btn mc-btn-orange" style="width:100%;" data-tip="↺ Вернуть окна в позицию по умолчанию">↺ Сбросить положение окон</button>
@@ -2830,12 +3007,6 @@ function openSettingsWindow() {
         togglePanel('scheduleSettingsPanel');
         if (wasHidden) buildSchedulePanel();
     });
-    document.getElementById('msFieldsSettingsBtn').addEventListener('click', () => {
-        const panel = document.getElementById('msFieldsPanel');
-        const wasHidden = panel.style.display === 'none';
-        togglePanel('msFieldsPanel');
-        if (wasHidden) buildMsFieldsPanel();
-    });
     const msQuickCb = document.getElementById('msQuickPanelCheckbox');
     if (msQuickCb) {
         msQuickCb.checked = msQuickPanelEnabled;
@@ -2858,6 +3029,21 @@ function openSettingsWindow() {
     }
     const quickCb = document.getElementById('hackerQuickButtonsCheckbox');
     if (quickCb) { quickCb.checked = hackerQuickButtonsEnabled; quickCb.addEventListener('change', () => { hackerQuickButtonsEnabled = quickCb.checked; localStorage.setItem(storageKey('hackerQuickButtons_v1'), String(hackerQuickButtonsEnabled)); buildMsQuickPanel(); }); }
+    const magicArea = document.getElementById('msMagicConfigJson');
+    const magicStatus = document.getElementById('msMagicConfigStatus');
+    if (magicArea) magicArea.value = JSON.stringify(msMagicConfig, null, 2);
+    document.getElementById('msMagicSettingsBtn')?.addEventListener('click', () => togglePanel('msMagicSettingsPanel'));
+    document.getElementById('msMagicConfigSave')?.addEventListener('click', () => {
+        try {
+            const parsed = JSON.parse(magicArea?.value || '');
+            saveMsMagicConfig(parsed);
+            if (magicArea) magicArea.value = JSON.stringify(msMagicConfig, null, 2);
+            if (magicStatus) { magicStatus.textContent = '✅ Сохранено'; magicStatus.style.color = '#16a34a'; }
+            reconcileMsEnhancements();
+        } catch (error) {
+            if (magicStatus) { magicStatus.textContent = `❌ Ошибка: ${error.message}`; magicStatus.style.color = '#dc2626'; }
+        }
+    });
     const bearerCb = document.getElementById('msBearerCheckbox');
     const bearerInp = document.getElementById('msBearerToken');
     if (bearerCb && bearerInp) {
@@ -2906,6 +3092,9 @@ function openSettingsWindow() {
 const TAB_LABELS = {
     checkHatiko: '🐶 Hatiko',
     checkHatikoBonuses: '🎁 Бонусы',
+    today: '🟢 Сегодня',
+    tomorrow: '🟡 Завтра',
+    hacker: '🐱‍💻 ХатикоХакер',
     calculator: '🧮 Калькулятор',
     calculator_reverse: '🔄 Реверс',
     calculator_discount: '🎉 Скидка/+',
@@ -2947,10 +3136,8 @@ function setupEventListeners() {
         document.getElementById('mcClearChatButton').addEventListener('click', clearChat);
 
         // Быстрые действия и настройки (нижняя панель)
-            document.getElementById('mcActionToday').addEventListener('click', fetchWhoWorksToday);
-            document.getElementById('mcActionTomorrow').addEventListener('click', fetchWhoWorksTomorrow);
-            document.getElementById('mcActionHacker').addEventListener('click', () => {
-                if (hackerCanRun()) openHackerWindow();
+            document.getElementById('mcClearTextToggle').addEventListener('click', () => {
+                setClearTextEnabled(!clearTextEnabled);
             });
             document.getElementById('mcActionSettings').addEventListener('click', openSettingsWindow);
 
@@ -2989,7 +3176,17 @@ function selectTab(tab) {
         const titleEl = document.getElementById('memchatTabTitle');
         if (titleEl) titleEl.textContent = TAB_LABELS[tab] || tab;
 
-        renderChat();
+        const special = document.getElementById('mcSpecialPane');
+        const input = document.getElementById('mcInputRegion');
+        const result = document.getElementById('mcResultRegion');
+        const isSchedule = tab === 'today' || tab === 'tomorrow';
+        const isSpecial = isSchedule || tab === 'hacker';
+        if (special) special.style.display = isSpecial ? 'flex' : 'none';
+        if (input) input.style.display = isSpecial ? 'none' : 'block';
+        if (result) result.style.display = isSpecial ? 'none' : 'flex';
+        if (isSchedule) renderScheduleTab(tab);
+        else if (tab === 'hacker') renderHackerInlineTab();
+        else renderChat();
     }
 
 // Восстановить последний выбранный режим (только режимные вкладки)
@@ -3020,9 +3217,12 @@ function initialize() {
     loadCalcRules();
     loadScheduleReplacements();
     loadChatHistory();
+    setupGlobalClearTextFunctionality();
     loadHiddenFields();
+    if (hiddenFields.length) { hiddenFields = []; saveHiddenFields(); }
     loadMsQuickPanelEnabled();
     hackerLoadSettings();
+    loadMsMagicConfig();
     try {
         hackerDefaultChannel = localStorage.getItem(storageKey('hackerDefaultChannel_v1')) || '';
         hackerQuickButtonsEnabled = localStorage.getItem(storageKey('hackerQuickButtons_v1')) !== 'false';
@@ -3033,37 +3233,15 @@ function initialize() {
         GM_registerMenuCommand('Закрыть мемный чат', closeChatWindow);
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
-        if (/online\.moysklad\.ru$/.test(location.hostname)) {
-            GM_registerMenuCommand('👁 Показать/скрыть поля МойСклад', toggleMsFieldsRevealed);
-        }
     debugLog('init', 'initialized');
-    console.log('Мемный чат v7.7.0-beta инициализирован');
+    console.log('Мемный чат v8.0.0-beta инициализирован');
 
-    // Скрытие полей МойСклад: применить и следить за перерисовками SPA
-    if (/online\.moysklad\.ru$/.test(location.hostname) && hiddenFields.length) {
-        applyMsHiddenFields();
-        updateMsRevealButton();
-        msFieldObserver = new MutationObserver(() => {
-            // Дебаунс: SPA-перерисовки шквалом меняют DOM
-            clearTimeout(msFieldObserver._t);
-            msFieldObserver._t = setTimeout(() => {
-                if (msFieldsRevealed) return;
-                msHiddenTargets.forEach(t => { if (!t.el.isConnected) t.el.style.display = ''; });
-                msHiddenTargets = msHiddenTargets.filter(t => t.el.isConnected);
-                applyMsHiddenFields();
-            }, 300);
-        });
-        msFieldObserver.observe(document.body, { childList: true, subtree: true });
-    }
-
-    // Панель быстрых кнопок МойСклад: строится на карточках, следит за SPA-навигацией
-    if (/online\.moysklad\.ru$/.test(location.hostname) && msQuickPanelEnabled) {
-        buildMsQuickPanel();
-        msQuickObserver = new MutationObserver(() => {
-            clearTimeout(msQuickObserver._t);
-            msQuickObserver._t = setTimeout(buildMsQuickPanel, 400);
-        });
-        msQuickObserver.observe(document.body, { childList: true, subtree: true });
+    // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
+    if (/online\.moysklad\.ru$/.test(location.hostname)) {
+        restoreMsFields(); // миграция со старого режима выборочного скрытия
+        document.getElementById('mcMsRevealBtn')?.remove();
+        startMsSpaObserver();
+        if (hackerBearerEnabled && hackerBearerToken.trim()) hackerValidateApiKey();
     }
 }
 
@@ -3084,6 +3262,7 @@ let hackerPayMethods     = [];  // [{name, href}] — атрибут paymentin �
 let hackerSalesChannels  = [];  // [{name, href}]
 let hackerOrderInfo      = null;
 let hackerLastDemand     = null;
+let hackerContext        = { customerOrderId: '', demandId: '' };
 let hackerBusy           = false;
 
 const HACKER_ATTR_CLIENT_STATUS = 'Статус клиента';
@@ -3121,6 +3300,17 @@ function hackerSetBearerEnabled(enabled) {
     hackerSaveSettings();
     const inp = document.getElementById('msBearerToken');
     if (inp) inp.style.display = hackerBearerEnabled ? 'block' : 'none';
+    hackerSyncAccessUi();
+}
+
+function hackerSyncAccessUi() {
+    const allowed = hackerBearerEnabled && !!hackerBearerToken.trim() && hackerApiValidated;
+    const tab = document.querySelector('#mcTabs [data-tab="hacker"]');
+    if (tab) tab.hidden = !allowed;
+    if (!allowed && currentAction === 'hacker' && document.getElementById('mcTabs')) {
+        selectTab('checkHatiko');
+    }
+    if (typeof reconcileMsEnhancements === 'function') reconcileMsEnhancements();
 }
 
 function hackerUpdateBearerStatus(code, text) {
@@ -3134,16 +3324,25 @@ function hackerValidateApiKey(onDone) {
     if (!hackerBearerEnabled || !hackerBearerToken.trim()) {
         hackerApiValidated = false;
         hackerUpdateBearerStatus('—', 'выкл');
+        hackerSyncAccessUi();
         onDone?.(false);
         return;
     }
     msApi('GET', '/entity/customerorder/metadata', null, response => {
         hackerApiValidated = true;
+        const states = Array.isArray(response?.states) ? response.states : (response?.states?.rows || []);
+        hackerStates = states.map(state => ({
+            name: state.name,
+            href: state.meta?.href,
+            color: state.color,
+        })).filter(state => state.name && state.href);
         hackerUpdateBearerStatus(response?._status || 200, 'валиден');
+        hackerSyncAccessUi();
         onDone?.(true);
     }, error => {
         hackerApiValidated = false;
         hackerUpdateBearerStatus(error?.status || 401, 'ошибка');
+        hackerSyncAccessUi();
         onDone?.(false);
     });
 }
@@ -3165,15 +3364,22 @@ function hackerSetBearerToken(value) {
     hackerBearerToken = String(value || '');
     hackerApiValidated = false;
     hackerSaveSettings();
+    hackerSyncAccessUi();
 }
 
 // ─── Транспорт ────────────────────────────────────────────────────────────────
+function hackerEnsureBearer() {
+    if (!hackerBearerEnabled || !hackerBearerToken.trim()) {
+        throw new Error('Включите Bearer и укажите API-ключ МойСклад');
+    }
+}
+
 function msApi(method, path, body, onSuccess, onError) {
+    try { hackerEnsureBearer(); }
+    catch (error) { onError(error); return; }
     const headers = { 'Accept': 'application/json;charset=utf-8' };
     if (body) headers['Content-Type'] = 'application/json;charset=utf-8';
-    if (hackerBearerEnabled && hackerBearerToken.trim()) {
-        headers['Authorization'] = 'Bearer ' + hackerBearerToken.trim();
-    }
+    headers['Authorization'] = 'Bearer ' + hackerBearerToken.trim();
     GM_xmlhttpRequest({
         method,
         url: MS_API_BASE + path,
@@ -3367,6 +3573,13 @@ function hackerRefreshStates(quiet) {
             if (!quiet) hackerLog(`Статусы обновлены: ${hackerStates.length} шт.`, 'ok');
         })
         .catch(error => hackerLog('Статусы: ' + error.message, 'err'));
+}
+
+function hackerUpdateOrderStatus(orderId, stateHref) {
+    hackerEnsureBearer();
+    return msApiP('PUT', `/entity/customerorder/${orderId}`, {
+        state: { meta: { href: stateHref, type: 'state', mediaType: 'application/json' } },
+    });
 }
 
 function hackerApplyStatus() {
@@ -3775,24 +3988,26 @@ function hackerBuildSaleTab() {
     rowChannel.appendChild(channelBtn);
     wrap.appendChild(rowChannel);
 
-    const actions = hackerEl('div', 'display:flex;gap:5px;flex-wrap:wrap;margin-top:4px;');
-    const demandBtn = hackerBtn('hackerCreateDemand', 'Создать отгрузку',
-        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#6366f1,#4f46e5);flex:1;');
-    demandBtn.addEventListener('click', hackerCreateDemand);
-    const cashinBtn = hackerBtn('hackerCreateCashin', 'Создать приходный ордер',
-        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#22c55e,#16a34a);flex:1;');
-    cashinBtn.addEventListener('click', hackerCreateCashin);
-    const payinBtn = hackerBtn('hackerCreatePaymentin', 'Создать входящий платёж',
-        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#f97316,#ea580c);flex:1;');
-    payinBtn.addEventListener('click', hackerCreatePaymentin);
-    const creditBtn = hackerBtn('hackerCreateCredit', 'Кредит/Рассрочка',
-        HACKER_BTN_CSS + 'background:linear-gradient(135deg,#8b5cf6,#6d28d9);flex:1;');
-    creditBtn.addEventListener('click', hackerCreateCredit);
-    actions.appendChild(demandBtn);
-    actions.appendChild(cashinBtn);
-    actions.appendChild(payinBtn);
-    actions.appendChild(creditBtn);
-    wrap.appendChild(actions);
+    if (HACKER_QUICK_API_ROW_ENABLED) {
+        const actions = hackerEl('div', 'display:flex;gap:5px;flex-wrap:wrap;margin-top:4px;');
+        const demandBtn = hackerBtn('hackerCreateDemand', 'Создать отгрузку',
+            HACKER_BTN_CSS + 'background:linear-gradient(135deg,#6366f1,#4f46e5);flex:1;');
+        demandBtn.addEventListener('click', hackerCreateDemand);
+        const cashinBtn = hackerBtn('hackerCreateCashin', 'Создать приходный ордер',
+            HACKER_BTN_CSS + 'background:linear-gradient(135deg,#22c55e,#16a34a);flex:1;');
+        cashinBtn.addEventListener('click', hackerCreateCashin);
+        const payinBtn = hackerBtn('hackerCreatePaymentin', 'Создать входящий платёж',
+            HACKER_BTN_CSS + 'background:linear-gradient(135deg,#f97316,#ea580c);flex:1;');
+        payinBtn.addEventListener('click', hackerCreatePaymentin);
+        const creditBtn = hackerBtn('hackerCreateCredit', 'Кредит/Рассрочка',
+            HACKER_BTN_CSS + 'background:linear-gradient(135deg,#8b5cf6,#6d28d9);flex:1;');
+        creditBtn.addEventListener('click', hackerCreateCredit);
+        actions.appendChild(demandBtn);
+        actions.appendChild(cashinBtn);
+        actions.appendChild(payinBtn);
+        actions.appendChild(creditBtn);
+        wrap.appendChild(actions);
+    }
     return wrap;
 }
 
@@ -3849,14 +4064,19 @@ async function hackerGetOrder() {
     const doc = hackerCurrentOrder();
     if (!doc) throw new Error('нет открытого заказа или отгрузки');
     if (doc.type === 'demand') {
-        const demand = await msApiP('GET', '/entity/demand/' + doc.id + '?expand=customerOrder');
+        const demand = hackerLastDemand?.id === doc.id
+            ? hackerLastDemand
+            : await msApiP('GET', '/entity/demand/' + doc.id + '?expand=customerOrder');
         hackerLastDemand = demand;
+        const orderId = demand.customerOrder?.meta?.href?.split('/').pop() || '';
+        hackerContext = { customerOrderId: orderId, demandId: doc.id };
         return { doc, order: demand };
     }
     const order = hackerOrderInfo && hackerOrderInfo.id === doc.id
         ? hackerOrderInfo
         : await msApiP('GET', '/entity/customerorder/' + doc.id + '?expand=positions.assortment');
     hackerOrderInfo = order;
+    hackerContext = { customerOrderId: doc.id, demandId: hackerContext.customerOrderId === doc.id ? hackerContext.demandId : '' };
     return { doc, order };
 }
 
@@ -3954,6 +4174,7 @@ async function hackerCreateDemand() {
         hackerOrderInfo = order;
         const demand = await hackerPostWithNameRetry('demand', await hackerBuildDemandBody(order, doc), order.name || ('Автопродажа ' + doc.id));
         hackerLastDemand = demand;
+        hackerContext = { customerOrderId: doc.id, demandId: demand.id };
         hackerLog(`✅ Отгрузка создана: ${demand.name}`, 'ok');
         location.hash = '#demand/edit?id=' + demand.id;
     } catch (error) { hackerLog('Отгрузка: ' + (error.message || error), 'err'); }
@@ -3964,7 +4185,7 @@ async function hackerCreatePaymentDocument(entityType) {
     const sum = hackerParseSumToKopecks(document.getElementById('hackerSaleSum')?.value);
     if (!sum) { hackerLog(`${entityType === 'cashin' ? 'Приходный ордер' : 'Входящий платёж'}: сумма пустая/0 — пропущен`); return; }
     const { doc, order } = await hackerGetOrder();
-    const demand = hackerLastDemand;
+    const demand = hackerLastDemand?.id === doc.id ? hackerLastDemand : null;
     const body = { organization: order.organization, agent: order.agent, sum, moment: order.moment };
     const linkedDocument = demand?.id
         ? { id: demand.id, type: 'demand', label: 'отгрузке' }
@@ -4028,173 +4249,6 @@ async function hackerCreatePaymentin() {
     finally { hackerSetActionBusy(false); }
 }
 
-// Старый общий сценарий оставлен для совместимости с сохранёнными dev-сборками.
-function hackerInvokeAutosale() {
-    if (hackerBusy) { hackerLog('Уже выполняется…', 'warn'); return; }
-    const doc = hackerOpenDoc();
-    if (!doc || doc.type !== 'customerorder') {
-        hackerLog('Откройте карточку заказа покупателя', 'warn');
-        return;
-    }
-    const cashinSum = hackerParseSumToKopecks(document.getElementById('hackerCashinSum')?.value);
-    const payinSum = hackerParseSumToKopecks(document.getElementById('hackerPayinSum')?.value);
-    const clientStatusHref = document.getElementById('hackerClientStatusSelect')?.value || '';
-    const payMethodHref = document.getElementById('hackerPayMethodSelect')?.value || '';
-    const channelChoice = document.getElementById('hackerChannelSelect')?.value || '';
-    if (payinSum > 0 && !payMethodHref) {
-        hackerMarkRequiredSelect('hackerPayMethodSelect', 'Выберите «Способ оплаты» для входящего платежа');
-        return;
-    }
-    const cashPayTypeHrefPromise = cashinSum > 0 ? hackerRefreshCashPayType() : Promise.resolve(null);
-
-    hackerBusy = true;
-    const invokeBtn = document.getElementById('hackerInvoke');
-    if (invokeBtn) { invokeBtn.disabled = true; invokeBtn.style.opacity = '.6'; }
-
-    const finish = () => {
-        hackerBusy = false;
-        if (invokeBtn) { invokeBtn.disabled = false; invokeBtn.style.opacity = '1'; }
-    };
-
-    (async () => {
-        try {
-            hackerLog('INVOKE: запускаю…');
-            // 1. Заказ (свежая копия — для agent/org/store/канала)
-            const order = hackerOrderInfo && hackerOrderInfo.id === doc.id
-                ? hackerOrderInfo
-                : await msApiP('GET', '/entity/customerorder/' + doc.id + '?expand=positions.assortment');
-            hackerOrderInfo = order;
-            const orderSum = order.sum || 0;
-
-            // 2. Отгрузка из заказа: MS сам создаст позиции и связи
-            hackerLog('Создаю отгрузку…');
-            const demandBody = {
-                moment: order.moment,
-                organization: order.organization,
-                agent: order.agent,
-                store: order.store,
-                customerOrder: {
-                    meta: {
-                        href: MS_API_BASE + '/entity/customerorder/' + doc.id,
-                        type: 'customerorder'
-                    }
-                },
-                // API не переносит позиции одной ссылкой на заказ — передаём их явно.
-                positions: (Array.isArray(order.positions)
-                    ? order.positions
-                    : (order.positions?.rows || [])).map(position => {
-                    const copy = {
-                        assortment: position.assortment,
-                        quantity: position.quantity,
-                        price: position.price
-                    };
-                    ['discount', 'vat', 'pack', 'things', 'reserve'].forEach(key => {
-                        if (position[key] !== undefined) copy[key] = position[key];
-                    });
-                    return copy;
-                })
-            };
-            // Канал продаж: выбранное значение, иначе — как в заказе, иначе — рандом из справочника
-            let channelHref = channelChoice;
-            let channelNote = 'как выбрано';
-            if (!channelHref && order.salesChannel && order.salesChannel.meta) {
-                channelHref = order.salesChannel.meta.href;
-                channelNote = 'как в заказе';
-            }
-            if (!channelHref) {
-                if (!hackerSalesChannels.length) await hackerRefreshSalesChannels(true);
-                if (hackerSalesChannels.length) {
-                    channelHref = hackerSalesChannels[Math.floor(Math.random() * hackerSalesChannels.length)].href;
-                    channelNote = 'рандом';
-                }
-            }
-            if (channelHref) {
-                demandBody.salesChannel = {
-                    meta: hackerMetaRef(channelHref, 'saleschannel')
-                };
-                hackerLog(`Канал продаж отгрузки: ${channelNote}`);
-            }
-
-            // В карточке отгрузки канал встречается и как системное поле salesChannel,
-            // и как пользовательский атрибут «Канал продаж». Копируем оба значения.
-            const selectedChannel = hackerSalesChannels.find(item => item.href === channelHref);
-            const channelName = selectedChannel?.name || order.salesChannel?.name || '';
-            if (!selectedChannel?.customHref) {
-                throw new Error('Для выбранного канала продаж не найдено значение атрибута отгрузки');
-            }
-            const demandChannelAttr = await hackerFetchMetadataAttribute('demand', 'Канал продаж');
-            if (!demandChannelAttr?.meta?.href) {
-                throw new Error('В отгрузке не найден обязательный атрибут «Канал продаж»');
-            }
-            demandBody.attributes = [{
-                meta: hackerMetaRef(demandChannelAttr.meta.href, 'attributemetadata'),
-                value: { meta: hackerMetaRef(selectedChannel.customHref, 'customentity') }
-            }];
-            hackerLog('Канал продаж продублирован в атрибут отгрузки');
-
-            const demandName = order.name || ('Автопродажа ' + doc.id);
-            const demand = await hackerPostWithNameRetry('demand', demandBody, demandName);
-            hackerLog(`✅ Отгрузка создана: ${demand.name}`, 'ok');
-
-            // 3. ПКО (приходный ордер) — если сумма > 0
-            if (cashinSum > 0) {
-                const cashinBody = {
-                    organization: order.organization,
-                    agent: order.agent,
-                    sum: cashinSum,
-                    operations: [{
-                        meta: {
-                            href: MS_API_BASE + '/entity/demand/' + demand.id,
-                            type: 'demand',
-                            mediaType: 'application/json'
-                        },
-                        linkedSum: cashinSum
-                    }]
-                };
-                const clientAttrBody = await hackerBuildAttrBody('cashin', HACKER_ATTR_CLIENT_STATUS, clientStatusHref);
-                const cashPayTypeHref = await cashPayTypeHrefPromise;
-                const payTypeAttrBody = await hackerBuildAttrBody('cashin', HACKER_ATTR_PAY_TYPE, cashPayTypeHref);
-                cashinBody.attributes = [clientAttrBody, payTypeAttrBody].filter(Boolean);
-                const cashin = await hackerPostWithNameRetry('cashin', cashinBody, demandName);
-                hackerLog(`✅ Приходный ордер создан: ${cashin.name} (${(cashinSum / 100).toFixed(2)} ₽)`, 'ok');
-            } else {
-                hackerLog('Приходный ордер: сумма пустая/0 — пропущен');
-            }
-
-            // 4. Входящий платёж — если сумма > 0
-            if (payinSum > 0) {
-                const payinBody = {
-                    organization: order.organization,
-                    agent: order.agent,
-                    sum: payinSum,
-                    operations: [{
-                        meta: {
-                            href: MS_API_BASE + '/entity/demand/' + demand.id,
-                            type: 'demand',
-                            mediaType: 'application/json'
-                        },
-                        linkedSum: payinSum
-                    }]
-                };
-                const attrBody = await hackerBuildAttrBody('paymentin', HACKER_ATTR_PAY_METHOD, payMethodHref);
-                if (attrBody) payinBody.attributes = [attrBody];
-                const payin = await hackerPostWithNameRetry('paymentin', payinBody, demandName);
-                hackerLog(`✅ Входящий платёж создан: ${payin.name} (${(payinSum / 100).toFixed(2)} ₽)`, 'ok');
-            } else {
-                hackerLog('Входящий платёж: сумма пустая/0 — пропущен');
-            }
-
-            // 5. Открываем отгрузку
-            hackerLog('Открываю отгрузку…', 'ok');
-            location.hash = '#demand/edit?id=' + demand.id;
-        } catch (error) {
-            hackerLog('INVOKE: ' + (error.message || error), 'err');
-        } finally {
-            finish();
-        }
-    })();
-}
-
 async function hackerCheckOrderSum() {
     try {
         const { order } = await hackerGetOrder();
@@ -4212,6 +4266,510 @@ async function hackerCheckOrderSum() {
 function hackerParseSumToKopecks(value) {
     const n = parseFloat(String(value || '').replace(',', '.').replace(/\s/g, ''));
     return (isFinite(n) && n > 0) ? Math.round(n * 100) : 0;
+}
+
+/* ===== 12-moysklad-ux.js ===== */
+
+// ─── Контекстный UX МойСклад ─────────────────────────────────────────────────
+// Идемпотентные DOM-встройки для карточек документов. Бизнес-действия используют
+// либо штатный UI МойСклад, либо небольшие проверенные API-вызовы.
+
+let msSpaObserver = null;
+let msSpaReconcileTimer = null;
+
+function msCurrentDocument() {
+    const match = location.hash.match(/^#(customerorder|demand|cashin|paymentin)\/edit\?[^#]*\bid=([0-9a-f-]+)/i);
+    return match ? { type: match[1].toLowerCase(), id: match[2] } : null;
+}
+
+function msVisible(element) {
+    return !!element && element.isConnected && element.offsetHeight > 0;
+}
+
+function msExactTextElements(text) {
+    const found = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+        if ((node.textContent || '').trim() !== text) continue;
+        const element = node.parentElement;
+        if (element && msVisible(element) && !element.closest('[id^="mc"]')) found.push(element);
+    }
+    return found;
+}
+
+function msFieldHostFromLabel(labelElement) {
+    if (!labelElement) return null;
+    const title = labelElement.closest('[class*="formItemTitle"]');
+    if (title) {
+        const parent = title.parentElement;
+        const index = Array.prototype.indexOf.call(parent.children, title);
+        return parent.children[index + 1] || null;
+    }
+    const legend = labelElement.closest('td.legend') || labelElement.closest('td');
+    if (legend?.nextElementSibling) return legend.nextElementSibling;
+    return labelElement.nextElementSibling || labelElement.parentElement?.nextElementSibling || null;
+}
+
+function msFindOrderStatusAnchor() {
+    if (msCurrentDocument()?.type !== 'customerorder') return null;
+    const testIdAnchor = document.querySelector('[data-test-id="doc-status"]');
+    if (msVisible(testIdAnchor)) return testIdAnchor;
+    const labelled = msExactTextElements('Статус')
+        .map(element => msFieldHostFromLabel(element))
+        .find(msVisible);
+    if (labelled) return labelled.querySelector('button,[role="button"],.b-popup-button') || labelled;
+
+    const names = new Set(hackerStates.map(state => state.name));
+    if (!names.size) return null;
+    return [...document.querySelectorAll('button,[role="button"],.b-popup-button')]
+        .find(element => msVisible(element) && names.has((element.textContent || '').trim()) && !element.closest('[id^="mc"]')) || null;
+}
+
+function msToast(message, kind = 'info') {
+    let toast = document.getElementById('mcMsToast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'mcMsToast';
+        toast.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:2147483005;max-width:360px;'
+            + 'padding:9px 12px;border-radius:9px;box-shadow:0 6px 24px #0f172a40;font:12px Segoe UI,sans-serif;';
+        document.body.appendChild(toast);
+    }
+    const colors = kind === 'error'
+        ? ['#fee2e2', '#991b1b', '#fecaca']
+        : kind === 'ok' ? ['#dcfce7', '#166534', '#86efac'] : ['#eff6ff', '#1d4ed8', '#bfdbfe'];
+    toast.style.background = colors[0];
+    toast.style.color = colors[1];
+    toast.style.border = `1px solid ${colors[2]}`;
+    toast.textContent = message;
+    clearTimeout(msToast._timer);
+    msToast._timer = setTimeout(() => toast.remove(), kind === 'error' ? 6000 : 2500);
+}
+
+function msFillStatusSelect(select) {
+    if (!select?.isConnected) return;
+    const previous = select.value;
+    select.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = '— выберите статус —';
+    select.appendChild(placeholder);
+    hackerStates.forEach(state => {
+        const option = document.createElement('option');
+        option.value = state.href;
+        option.textContent = state.name;
+        select.appendChild(option);
+    });
+    if ([...select.options].some(option => option.value === previous)) select.value = previous;
+}
+
+function closeMsOrderStatusPopup() {
+    document.getElementById('mcOrderStatusPopup')?.remove();
+}
+
+function openMsOrderStatusPopup(anchor) {
+    const old = document.getElementById('mcOrderStatusPopup');
+    if (old) { old.remove(); return; }
+    const popup = document.createElement('div');
+    popup.id = 'mcOrderStatusPopup';
+    popup.style.cssText = 'position:fixed;z-index:2147483004;width:280px;padding:10px;background:#fff;'
+        + 'border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 8px 30px #0f172a40;font:12px Segoe UI,sans-serif;color:#334155;';
+    const rect = anchor.getBoundingClientRect();
+    popup.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 296))}px`;
+    popup.style.top = `${Math.min(rect.bottom + 5, window.innerHeight - 190)}px`;
+
+    const title = document.createElement('strong');
+    title.textContent = '🎯 Сменить статус заказа';
+    popup.appendChild(title);
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:5px;margin-top:8px;';
+    const select = document.createElement('select');
+    select.id = 'mcOrderStatusSelect';
+    select.style.cssText = 'flex:1;min-width:0;padding:6px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#334155;';
+    msFillStatusSelect(select);
+    row.appendChild(select);
+    const refresh = document.createElement('button');
+    refresh.type = 'button';
+    refresh.textContent = '↻';
+    refresh.title = 'Обновить список статусов';
+    refresh.style.cssText = 'width:32px;border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc;cursor:pointer;';
+    refresh.addEventListener('click', () => {
+        refresh.disabled = true;
+        hackerRefreshStates(true).then(() => msFillStatusSelect(select)).finally(() => { refresh.disabled = false; });
+    });
+    row.appendChild(refresh);
+    popup.appendChild(row);
+
+    const error = document.createElement('div');
+    error.id = 'mcOrderStatusError';
+    error.style.cssText = 'display:none;margin-top:7px;color:#991b1b;background:#fee2e2;border-radius:6px;padding:6px;';
+    popup.appendChild(error);
+    const apply = document.createElement('button');
+    apply.type = 'button';
+    apply.textContent = 'Поменять и обновить страницу';
+    apply.style.cssText = 'width:100%;margin-top:8px;padding:7px;border:0;border-radius:7px;background:#2563eb;color:#fff;font-weight:600;cursor:pointer;';
+    apply.addEventListener('click', async () => {
+        const doc = msCurrentDocument();
+        if (!doc || !select.value) {
+            error.textContent = 'Выберите статус';
+            error.style.display = 'block';
+            return;
+        }
+        apply.disabled = true;
+        error.style.display = 'none';
+        try {
+            await hackerUpdateOrderStatus(doc.id, select.value);
+            msToast('✅ Статус изменён. Обновляю страницу…', 'ok');
+            setTimeout(() => location.reload(), 250);
+        } catch (reason) {
+            error.textContent = reason.message || String(reason);
+            error.style.display = 'block';
+            apply.disabled = false;
+        }
+    });
+    popup.appendChild(apply);
+    document.body.appendChild(popup);
+    if (!hackerStates.length) refresh.click();
+}
+
+function buildMsOrderStatusAction() {
+    const existing = document.getElementById('mcOrderStatusAction');
+    const allowed = hackerBearerEnabled && !!hackerBearerToken.trim() && hackerApiValidated;
+    if (!allowed || msCurrentDocument()?.type !== 'customerorder') {
+        existing?.remove();
+        closeMsOrderStatusPopup();
+        return;
+    }
+    if (existing?.isConnected) return;
+    const anchor = msFindOrderStatusAnchor();
+    if (!anchor) return;
+    const button = document.createElement('button');
+    button.id = 'mcOrderStatusAction';
+    button.type = 'button';
+    button.textContent = '🎯';
+    button.title = 'Быстро поменять статус заказа';
+    button.style.cssText = 'display:block;width:28px;height:24px;margin-top:3px;padding:0;border:1px solid #93c5fd;'
+        + 'border-radius:6px;background:#eff6ff;color:#1d4ed8;cursor:pointer;line-height:22px;';
+    button.addEventListener('click', () => openMsOrderStatusPopup(button));
+    anchor.insertAdjacentElement('afterend', button);
+}
+
+function validateMsMagicConfig(config) {
+    if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Корень JSON должен быть объектом');
+    ['demand', 'cashin', 'paymentin'].forEach(kind => {
+        if (config[kind] == null) return;
+        const section = config[kind];
+        if (!section || typeof section !== 'object' || Array.isArray(section)) throw new Error(`${kind}: нужен объект`);
+        if (section.copies != null && !Array.isArray(section.copies)) throw new Error(`${kind}.copies: нужен массив`);
+        if (section.values != null && !Array.isArray(section.values)) throw new Error(`${kind}.values: нужен массив`);
+        (section.copies || []).forEach((rule, index) => {
+            if (!rule || typeof rule.field !== 'string' || !Number.isInteger(rule.from) || !Array.isArray(rule.to)) {
+                throw new Error(`${kind}.copies[${index}]: нужны field, from и to`);
+            }
+        });
+        (section.values || []).forEach((rule, index) => {
+            if (!rule || typeof rule.field !== 'string' || typeof rule.value !== 'string') {
+                throw new Error(`${kind}.values[${index}]: нужны строковые field и value`);
+            }
+        });
+    });
+    return config;
+}
+
+function loadMsMagicConfig() {
+    try {
+        const saved = localStorage.getItem(storageKey('msMagicConfig_v1'));
+        msMagicConfig = saved ? validateMsMagicConfig(JSON.parse(saved)) : JSON.parse(JSON.stringify(DEFAULT_MS_MAGIC_CONFIG));
+    } catch (error) {
+        debugError('magic-config', error);
+        msMagicConfig = JSON.parse(JSON.stringify(DEFAULT_MS_MAGIC_CONFIG));
+    }
+    return msMagicConfig;
+}
+
+function saveMsMagicConfig(config) {
+    msMagicConfig = validateMsMagicConfig(config);
+    localStorage.setItem(storageKey('msMagicConfig_v1'), JSON.stringify(msMagicConfig));
+    return msMagicConfig;
+}
+
+function msFindFieldHosts(fieldName) {
+    return msExactTextElements(fieldName)
+        .map(label => msFieldHostFromLabel(label))
+        .filter((host, index, all) => host && all.indexOf(host) === index);
+}
+
+function msFieldControl(host) {
+    if (!host) return null;
+    if (host.matches?.('input,select,textarea,[contenteditable="true"],[role="combobox"]')) return host;
+    return host.querySelector('select,input:not([type="hidden"]),textarea,[contenteditable="true"],[role="combobox"],button,.b-popup-button') || host;
+}
+
+function msControlValue(control) {
+    if (!control) return '';
+    if (control instanceof HTMLSelectElement) return control.selectedOptions[0]?.textContent.trim() || '';
+    if ('value' in control && String(control.value || '').trim()) return String(control.value).trim();
+    return (control.textContent || '').replace(/[×✕▾▼]/g, '').trim();
+}
+
+function msDispatchControlEvents(control) {
+    ['input', 'change', 'keyup', 'blur'].forEach(type => control.dispatchEvent(new Event(type, { bubbles: true })));
+}
+
+async function msPickCustomOption(opener, value) {
+    opener.click();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const option = msExactTextElements(value).find(element => {
+        const clickable = element.closest('[role="option"],li,button,a,td,div');
+        return clickable && msVisible(clickable) && !clickable.closest('#mcMagicPopup') && !opener.contains(clickable);
+    });
+    const clickable = option?.closest('[role="option"],li,button,a,td,div');
+    if (!clickable) return false;
+    clickable.click();
+    await new Promise(resolve => setTimeout(resolve, 60));
+    return true;
+}
+
+async function msSetControlValue(control, value) {
+    if (!control || !value) return false;
+    if (control instanceof HTMLSelectElement) {
+        const option = [...control.options].find(item => item.textContent.trim() === value || item.value === value);
+        if (!option) return false;
+        control.value = option.value;
+        msDispatchControlEvents(control);
+        return true;
+    }
+    if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+        const combo = control.closest('[role="combobox"],[class*="combo" i],[class*="select" i]');
+        if ((control.readOnly || combo) && await msPickCustomOption(combo || control, value)) return true;
+        if (control.readOnly) return false;
+        const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(control), 'value');
+        if (descriptor?.set) descriptor.set.call(control, value); else control.value = value;
+        msDispatchControlEvents(control);
+        return msControlValue(control) === value;
+    }
+    if (control.isContentEditable) {
+        control.textContent = value;
+        msDispatchControlEvents(control);
+        return msControlValue(control) === value;
+    }
+
+    return msPickCustomOption(control, value);
+}
+
+function msNativeSaveButton() {
+    return msExactTextElements('Сохранить')
+        .map(element => element.closest('button,a,[role="button"]') || element)
+        .find(element => msVisible(element));
+}
+
+function msDocumentMagicRules(kind, overrides = {}) {
+    const base = msMagicConfig[kind] || {};
+    return {
+        copies: (base.copies || []).map(rule => ({ ...rule })),
+        values: (base.values || []).map((rule, index) => ({
+            ...rule,
+            value: Object.prototype.hasOwnProperty.call(overrides, index) ? overrides[index] : rule.value,
+        })),
+    };
+}
+
+async function msApplyMagicRules({ save = false, overrides = {} } = {}) {
+    const doc = msCurrentDocument();
+    if (!doc || !['demand', 'cashin', 'paymentin'].includes(doc.type)) {
+        return { changed: 0, missing: ['Откройте Отгрузку, Приходный ордер или Входящий платёж'], failed: [] };
+    }
+    const rules = msDocumentMagicRules(doc.type, overrides);
+    const result = { changed: 0, missing: [], failed: [] };
+
+    for (const rule of rules.copies) {
+        const hosts = msFindFieldHosts(rule.field);
+        const source = msFieldControl(hosts[rule.from]);
+        const sourceValue = msControlValue(source);
+        if (!sourceValue) {
+            if (rule.required) result.missing.push(rule.field);
+            continue;
+        }
+        for (const targetIndex of rule.to) {
+            const target = msFieldControl(hosts[targetIndex]);
+            if (!target || target === source) {
+                result.failed.push(rule.field);
+                continue;
+            }
+            if (await msSetControlValue(target, sourceValue)) result.changed += 1;
+            else result.failed.push(rule.field);
+        }
+    }
+
+    for (let index = 0; index < rules.values.length; index += 1) {
+        const rule = rules.values[index];
+        const value = String(rule.value || '').trim();
+        if (!value) {
+            if (rule.required) result.missing.push(rule.field);
+            continue;
+        }
+        const host = msFindFieldHosts(rule.field)[rule.occurrence || 0];
+        const control = msFieldControl(host);
+        if (await msSetControlValue(control, value)) result.changed += 1;
+        else result.failed.push(rule.field);
+    }
+
+    result.missing = [...new Set(result.missing)];
+    result.failed = [...new Set(result.failed)];
+    if (save && !result.missing.length && !result.failed.length) {
+        const saveButton = msNativeSaveButton();
+        if (saveButton) saveButton.click(); else result.failed.push('Кнопка «Сохранить»');
+    }
+    return result;
+}
+
+function closeMsMagicPopup() {
+    document.getElementById('mcMagicPopup')?.remove();
+}
+
+function openMsMagicPopup(anchor) {
+    const old = document.getElementById('mcMagicPopup');
+    if (old) { old.remove(); return; }
+    const doc = msCurrentDocument();
+    if (!doc) return;
+    const rules = msDocumentMagicRules(doc.type);
+    const popup = document.createElement('div');
+    popup.id = 'mcMagicPopup';
+    popup.style.cssText = 'position:fixed;z-index:2147483004;width:310px;padding:11px;background:#fff;border:1px solid #cbd5e1;'
+        + 'border-radius:10px;box-shadow:0 8px 30px #0f172a40;font:12px Segoe UI,sans-serif;color:#334155;';
+    const rect = anchor.getBoundingClientRect();
+    popup.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 328))}px`;
+    popup.style.top = `${Math.min(rect.bottom + 5, window.innerHeight - 260)}px`;
+    const title = document.createElement('strong');
+    title.textContent = '🪄 Заполнить документ';
+    popup.appendChild(title);
+
+    rules.copies.forEach(rule => {
+        const row = document.createElement('div');
+        row.style.cssText = 'margin-top:8px;padding:6px;background:#f8fafc;border-radius:6px;';
+        row.textContent = `${rule.field}: скопировать значение между полями`;
+        popup.appendChild(row);
+    });
+    rules.values.forEach((rule, index) => {
+        const label = document.createElement('label');
+        label.style.cssText = 'display:block;margin-top:8px;font-weight:600;';
+        label.textContent = rule.field;
+        const input = document.createElement('input');
+        input.dataset.magicValueIndex = String(index);
+        input.value = rule.value || '';
+        input.placeholder = 'Введите точное значение из списка МойСклад';
+        input.style.cssText = 'display:block;width:100%;box-sizing:border-box;margin-top:3px;padding:6px;border:1px solid #cbd5e1;border-radius:6px;';
+        label.appendChild(input);
+        popup.appendChild(label);
+    });
+    const error = document.createElement('div');
+    error.style.cssText = 'display:none;margin-top:8px;padding:6px;background:#fee2e2;color:#991b1b;border-radius:6px;';
+    popup.appendChild(error);
+    const apply = document.createElement('button');
+    apply.type = 'button';
+    apply.textContent = '🪄 Заполнить и сохранить';
+    apply.style.cssText = 'width:100%;margin-top:9px;padding:8px;border:0;border-radius:7px;background:#16a34a;color:#fff;font-weight:700;cursor:pointer;';
+    apply.addEventListener('click', async () => {
+        apply.disabled = true;
+        const overrides = {};
+        popup.querySelectorAll('[data-magic-value-index]').forEach(input => { overrides[input.dataset.magicValueIndex] = input.value; });
+        const result = await msApplyMagicRules({ save: true, overrides });
+        if (result.missing.length || result.failed.length) {
+            const details = [
+                result.missing.length ? `Заполните: ${result.missing.join(', ')}` : '',
+                result.failed.length ? `Не удалось установить: ${result.failed.join(', ')}` : ''
+            ].filter(Boolean).join('. ');
+            error.textContent = details;
+            error.style.display = 'block';
+            apply.disabled = false;
+            return;
+        }
+        msToast(`✅ Заполнено полей: ${result.changed}. Сохраняю…`, 'ok');
+        closeMsMagicPopup();
+    });
+    popup.appendChild(apply);
+    document.body.appendChild(popup);
+}
+
+function buildMsMagicFillAction() {
+    const existing = document.getElementById('mcMagicFillAction');
+    const doc = msCurrentDocument();
+    if (!doc || !['demand', 'cashin', 'paymentin'].includes(doc.type)) {
+        existing?.remove();
+        closeMsMagicPopup();
+        return;
+    }
+    if (existing?.isConnected && existing.dataset.kind === doc.type) return;
+    if (existing) { existing.remove(); closeMsMagicPopup(); }
+    const section = msMagicConfig[doc.type] || {};
+    const names = [...(section.copies || []), ...(section.values || [])].map(rule => rule.field);
+    const anchorHost = names.flatMap(msFindFieldHosts).find(msVisible);
+    const anchor = msFieldControl(anchorHost) || anchorHost;
+    if (!anchor) return;
+    const button = document.createElement('button');
+    button.id = 'mcMagicFillAction';
+    button.dataset.kind = doc.type;
+    button.type = 'button';
+    button.textContent = '🪄';
+    button.title = 'Заполнить настроенные поля и сохранить документ';
+    button.style.cssText = 'display:inline-block;margin-left:5px;padding:3px 7px;border:1px solid #c4b5fd;border-radius:6px;'
+        + 'background:#f5f3ff;color:#6d28d9;cursor:pointer;vertical-align:middle;';
+    button.addEventListener('click', () => openMsMagicPopup(button));
+    anchor.insertAdjacentElement('afterend', button);
+}
+
+function buildMsFieldsSpoiler() {
+    const existing = document.getElementById('mcMsFieldsSpoiler');
+    const doc = msCurrentDocument();
+    if (!doc) {
+        existing?.remove();
+        document.querySelectorAll('[data-mc-native-other-fields]').forEach(element => {
+            element.style.display = element.dataset.mcNativeOtherFields;
+            delete element.dataset.mcNativeOtherFields;
+        });
+        return;
+    }
+    if (existing?.isConnected) return;
+    const label = msExactTextElements('Другие поля')[0];
+    const native = label?.closest('button,[role="button"],a') || label;
+    if (!native || !native.parentElement) return;
+
+    const expanded = native.getAttribute('aria-expanded') === 'true';
+    const button = document.createElement('button');
+    button.id = 'mcMsFieldsSpoiler';
+    button.type = 'button';
+    button.textContent = `${expanded ? '▾' : '▸'} Дополнительные поля`;
+    button.style.cssText = 'display:block;width:min(480px,100%);margin:7px 0;padding:7px 10px;text-align:left;'
+        + 'border:1px solid #cbd5e1;border-radius:7px;background:#f8fafc;color:#475569;font-weight:600;cursor:pointer;';
+    button.addEventListener('click', () => {
+        native.click();
+        const nowExpanded = native.getAttribute('aria-expanded') === 'true'
+            || button.dataset.expanded !== 'true';
+        button.dataset.expanded = String(nowExpanded);
+        button.textContent = `${nowExpanded ? '▾' : '▸'} Дополнительные поля`;
+        localStorage.setItem(storageKey('msFieldsSpoilerOpen_v1'), String(nowExpanded));
+    });
+    native.insertAdjacentElement('afterend', button);
+    native.dataset.mcNativeOtherFields = native.style.display || '';
+    native.style.display = 'none';
+}
+
+function reconcileMsEnhancements() {
+    if (!/online\.moysklad\.ru$/.test(location.hostname)) return;
+    buildMsQuickPanel();
+    buildMsOrderStatusAction();
+    if (typeof buildMsMagicFillAction === 'function') buildMsMagicFillAction();
+    if (typeof buildMsFieldsSpoiler === 'function') buildMsFieldsSpoiler();
+}
+
+function startMsSpaObserver() {
+    if (!/online\.moysklad\.ru$/.test(location.hostname) || msSpaObserver) return;
+    reconcileMsEnhancements();
+    msSpaObserver = new MutationObserver(() => {
+        clearTimeout(msSpaReconcileTimer);
+        msSpaReconcileTimer = setTimeout(reconcileMsEnhancements, 350);
+    });
+    msSpaObserver.observe(document.body, { childList: true, subtree: true });
 }
 
 // ─── Production entrypoint ───────────────────────────────────────────────────
