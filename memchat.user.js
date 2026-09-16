@@ -4493,6 +4493,18 @@ function saveMsMagicConfig(config) {
     return msMagicConfig;
 }
 
+function saveMsMagicValueOverrides(kind, overrides) {
+    const config = JSON.parse(JSON.stringify(msMagicConfig));
+    const section = config[kind] || { copies: [], values: [] };
+    section.values = (section.values || []).map((rule, index) => (
+        Object.prototype.hasOwnProperty.call(overrides, index)
+            ? { ...rule, value: String(overrides[index] ?? '') }
+            : rule
+    ));
+    config[kind] = section;
+    return saveMsMagicConfig(config);
+}
+
 function msFindFieldHosts(fieldName) {
     return msExactTextElements(fieldName)
         .map(label => msFieldHostFromLabel(label))
@@ -4673,6 +4685,7 @@ function openMsMagicPopup(anchor) {
         apply.disabled = true;
         const overrides = {};
         popup.querySelectorAll('[data-magic-value-index]').forEach(input => { overrides[input.dataset.magicValueIndex] = input.value; });
+        saveMsMagicValueOverrides(doc.type, overrides);
         const result = await msApplyMagicRules({ save: true, overrides });
         if (result.missing.length || result.failed.length) {
             const details = [
