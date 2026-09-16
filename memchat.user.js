@@ -2772,7 +2772,7 @@ function renderHackerInlineTab() {
 
     hackerSelectTab(hackerTab);
     hackerRenderLog();
-    hackerRefreshStates(true);
+    hackerEnsureStates(true);
     if (/online\.moysklad\.ru$/.test(location.hostname)) hackerLoadOpenOrder(true);
 }
 
@@ -2842,7 +2842,7 @@ function openHackerWindow() {
 
     hackerSelectTab(hackerTab);
     hackerRenderLog();
-    hackerRefreshStates(true);
+    hackerEnsureStates(true);
     if (/online\.moysklad\.ru$/.test(location.hostname)) hackerLoadOpenOrder(true);
 }
 
@@ -2868,7 +2868,7 @@ function hackerSelectTab(key) {
     if (pane) panes.appendChild(pane);
 
     // Справочники загружаются при открытии соответствующей вкладки.
-    if (key === 'status') hackerRefreshStates(true);
+    if (key === 'status') hackerEnsureStates(true);
     if (key === 'sale') {
         hackerRefreshClientStatuses(true);
         hackerRefreshPayMethods(true);
@@ -3280,6 +3280,29 @@ function hackerLoadSettings() {
         hackerBearerEnabled = false;
         hackerBearerToken = '';
     }
+    hackerLoadCachedStates();
+}
+
+function hackerLoadCachedStates() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(storageKey('hackerStates_v1')) || '[]');
+        hackerStates = Array.isArray(saved)
+            ? saved.filter(state => state && typeof state.name === 'string' && typeof state.href === 'string' && state.name && state.href)
+                .map(state => ({ name: state.name, href: state.href, color: state.color }))
+            : [];
+    } catch (error) {
+        hackerStates = [];
+        debugError('hacker', 'Не удалось загрузить кэш статусов', error);
+    }
+    return hackerStates;
+}
+
+function hackerSaveStates() {
+    try {
+        localStorage.setItem(storageKey('hackerStates_v1'), JSON.stringify(hackerStates));
+    } catch (error) {
+        debugError('hacker', 'Не удалось сохранить кэш статусов', error);
+    }
 }
 
 function hackerSaveSettings() {
@@ -3336,6 +3359,7 @@ function hackerValidateApiKey(onDone) {
             href: state.meta?.href,
             color: state.color,
         })).filter(state => state.name && state.href);
+        hackerSaveStates();
         hackerUpdateBearerStatus(response?._status || 200, 'валиден');
         hackerSyncAccessUi();
         onDone?.(true);
@@ -3569,10 +3593,19 @@ function hackerRefreshStates(quiet) {
                 name: s.name,
                 href: s.meta?.href
             })).filter(s => s.href);
+            hackerSaveStates();
             hackerFillSelect(document.getElementById('hackerStateSelect'), hackerStates);
             if (!quiet) hackerLog(`Статусы обновлены: ${hackerStates.length} шт.`, 'ok');
         })
         .catch(error => hackerLog('Статусы: ' + error.message, 'err'));
+}
+
+function hackerEnsureStates(quiet) {
+    if (hackerStates.length) {
+        hackerFillSelect(document.getElementById('hackerStateSelect'), hackerStates);
+        return Promise.resolve(hackerStates);
+    }
+    return hackerRefreshStates(quiet).then(() => hackerStates);
 }
 
 function hackerUpdateOrderStatus(orderId, stateHref) {
@@ -4347,7 +4380,7 @@ function msToast(message, kind = 'info') {
 }
 
 function msFillStatusSelect(select) {
-    if (!select?.isConnected) return;
+    if (!select) return;
     const previous = select.value;
     select.replaceChildren();
     const placeholder = document.createElement('option');
@@ -4386,8 +4419,8 @@ function openMsOrderStatusPopup(anchor) {
     const select = document.createElement('select');
     select.id = 'mcOrderStatusSelect';
     select.style.cssText = 'flex:1;min-width:0;padding:6px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#334155;';
-    msFillStatusSelect(select);
     row.appendChild(select);
+    msFillStatusSelect(select);
     const refresh = document.createElement('button');
     refresh.type = 'button';
     refresh.textContent = '↻';
