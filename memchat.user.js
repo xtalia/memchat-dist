@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.0.0
+// @version      8.0.1
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.0.0';
+const MEMCHAT_VERSION = '8.0.1';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -111,6 +111,8 @@ let lastHatikoResults = [];
 let lastHatikoQuery = '';
 let hatikoSearchMode = 'auto';
 let activeRequestId = 0;
+// Поведение кнопки 🔁: append — сохранить старый ответ, replace — заменить его.
+let retryBehavior = 'append';
 
 // API МойСклад для ХатикоХакера
 let hackerBearerEnabled = false;
@@ -297,6 +299,25 @@ function saveHatikoSearchMode(mode) {
     if (!['auto', 'panel', 'hatiko'].includes(mode)) return;
     hatikoSearchMode = mode;
     localStorage.setItem(storageKey('hatikoSearchMode_v1'), mode);
+}
+
+function loadRetryBehavior() {
+    try {
+        const behavior = localStorage.getItem(storageKey('retryBehavior_v1'));
+        return behavior === 'replace' ? 'replace' : 'append';
+    } catch {
+        return 'append';
+    }
+}
+
+function saveRetryBehavior(behavior) {
+    if (!['append', 'replace'].includes(behavior)) return;
+    retryBehavior = behavior;
+    try {
+        localStorage.setItem(storageKey('retryBehavior_v1'), behavior);
+    } catch (error) {
+        debugError('storage', 'Не удалось сохранить поведение кнопки повтора', error);
+    }
 }
 
 // ─── Скрытые поля МойСклад ───────────────────────────────────────────────────
@@ -710,6 +731,20 @@ function renderMessageBubble(entry) {
 }
 
 // Делегированный клик по кнопкам «Копировать» / «Повторить» в ленте.
+function removeRetryEntry(entry) {
+    const history = chatHistoryByAction[currentAction] || [];
+    const index = history.indexOf(entry);
+    if (index < 0) return;
+
+    // В режиме замены убираем ответ и его исходный запрос, чтобы новый запуск
+    // не оставлял в ленте лишнюю пару user/bot.
+    history.splice(index, 1);
+    const previous = history[index - 1];
+    if (previous?.sender === 'user' && previous.message === entry.query) history.splice(index - 1, 1);
+    renderChat();
+    saveChatHistory();
+}
+
 function handleChatLogClick(event) {
     const copyBtn = event.target.closest('.mc-copy-btn');
     if (copyBtn) {
@@ -737,8 +772,9 @@ function handleChatLogClick(event) {
         retryBtn.classList.remove('mc-copy-done');
     }, 1200);
 
-    // Повторяем тот же запрос в той же вкладке
+    // Повторяем тот же запрос в той же вкладке.
     if (currentAction !== entry.action) selectTab(entry.action);
+    if (retryBehavior === 'replace') removeRetryEntry(entry);
     const input = document.getElementById('priceCheckInput');
     if (input) input.value = entry.query;
     executeCurrentAction();
@@ -2646,6 +2682,7 @@ function buildSettingsSnapshot() {
         clearTimeout: parseInt(document.getElementById('timeoutSlider')?.value || 500, 10),
         showHatikoLinks: loadShowHatikoLinks(),
         hatikoSearchMode,
+        retryBehavior,
         msQuickPanelEnabled,
         msMagicConfig
     };
@@ -2707,6 +2744,11 @@ function importSettings(jsonText) {
         saveHatikoSearchMode(data.hatikoSearchMode);
         const sel = document.getElementById('hatikoSearchMode');
         if (sel) sel.value = data.hatikoSearchMode;
+    }
+    if (['append', 'replace'].includes(data.retryBehavior)) {
+        saveRetryBehavior(data.retryBehavior);
+        const sel = document.getElementById('retryBehavior');
+        if (sel) sel.value = data.retryBehavior;
     }
     if (Array.isArray(data.hiddenFields)) {
         // Старые настройки выборочного скрытия больше не применяются: теперь
@@ -2931,6 +2973,13 @@ function openSettingsWindow() {
                 <option value="hatiko">Только сайт Hatiko</option>
             </select>
         </label>
+        <label style="display:block;color:#475569;font-size:12px;margin-top:10px;">
+            Поведение кнопки 🔁:
+            <select id="retryBehavior" style="display:block;width:100%;margin-top:5px;padding:5px;background:#fff;border:1px solid #cbd5e1;border-radius:6px;color:#334155;">
+                <option value="append">Не удалять старый ответ</option>
+                <option value="replace">Удалять старый ответ и повторять</option>
+            </select>
+        </label>
 
         <div style="height:8px;"></div>
         <button id="calcSettingsBtn" class="mc-btn mc-btn-slate" style="width:100%;">⚙️ Правила 🧮</button>
@@ -2998,6 +3047,11 @@ function openSettingsWindow() {
     setupGlobalClearTextFunctionality();
     setupHatikoLinksSetting();
     setupHatikoSearchModeSetting();
+    const retrySelect = document.getElementById('retryBehavior');
+    if (retrySelect) {
+        retrySelect.value = retryBehavior;
+        retrySelect.addEventListener('change', () => saveRetryBehavior(retrySelect.value));
+    }
     document.getElementById('timeoutSlider').addEventListener('input', e => {
         document.getElementById('timeoutValue').textContent = e.target.value;
     });
@@ -3227,6 +3281,7 @@ function initialize() {
     loadHiddenFields();
     if (hiddenFields.length) { hiddenFields = []; saveHiddenFields(); }
     loadMsQuickPanelEnabled();
+    retryBehavior = loadRetryBehavior();
     hackerLoadSettings();
     loadMsMagicConfig();
     try {
@@ -3240,7 +3295,7 @@ function initialize() {
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v8.0.0 инициализирован');
+    console.log('Мемный чат v8.0.1 инициализирован');
 
     // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
     if (/online\.moysklad\.ru$/.test(location.hostname)) {
