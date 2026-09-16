@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.0.0-beta
+// @version      8.0.0
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.0.0-beta';
+const MEMCHAT_VERSION = '8.0.0';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -3234,7 +3234,7 @@ function initialize() {
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v8.0.0-beta инициализирован');
+    console.log('Мемный чат v8.0.0 инициализирован');
 
     // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
     if (/online\.moysklad\.ru$/.test(location.hostname)) {
