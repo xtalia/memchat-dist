@@ -1938,16 +1938,21 @@ function buildMsQuickPanel() {
     const oldWrap = document.querySelector('[data-mc-quick-wrap]');
     const oldQuickRow = document.getElementById('mcHackerQuickRow');
     const kind = Object.keys(MS_QUICK_PANEL_CONFIG).find(k => MS_QUICK_PANEL_CONFIG[k].marker());
+    const cfg = kind ? MS_QUICK_PANEL_CONFIG[kind] : null;
+    const quickSignature = cfg ? [...cfg.create, ...cfg.print].join('\u001f') : '';
     const quickEnabled = HACKER_QUICK_API_ROW_ENABLED && hackerQuickButtonsEnabled;
+    const panelHealthy = old && old.isConnected && old.dataset.kind === kind
+        && old.dataset.quickSignature === quickSignature
+        && old.querySelectorAll('button').length === (cfg ? cfg.create.length + cfg.print.length : 0)
+        && (!quickEnabled || oldQuickRow?.isConnected);
     // Keep a complete pair stable across MutationObserver callbacks.
-    if (old && old.dataset.kind === kind && old.isConnected
-        && (!quickEnabled || oldQuickRow?.isConnected)) return;
+    if (panelHealthy) return;
     if (oldQuickRow) oldQuickRow.remove();
     if (!kind || !msQuickPanelEnabled) { if (oldWrap) oldWrap.remove(); else if (old) old.remove(); return; }
 
     if (oldWrap) oldWrap.remove(); else if (old) old.remove();
     // The old main panel may have been rebuilt by the SPA; create one fresh pair.
-    const cfg = MS_QUICK_PANEL_CONFIG[kind];
+
     const anchor = msGetToolbarButton('Создать документ') || msGetToolbarButton('Печать');
     if (!anchor) return;
     // минимальный общий контейнер тулбара (содержит и «Создать документ», и «Печать»)
@@ -1962,6 +1967,7 @@ function buildMsQuickPanel() {
     const panel = document.createElement('div');
     panel.id = 'mcQuickPanel';
     panel.dataset.kind = kind;
+    panel.dataset.quickSignature = quickSignature;
     panel.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:4px 0;';
 
     const mkBtn = (emoji, label, menuLabel) => {
@@ -4309,6 +4315,7 @@ function hackerParseSumToKopecks(value) {
 
 let msSpaObserver = null;
 let msSpaReconcileTimer = null;
+let msQuickKeepaliveTimer = null;
 
 function msCurrentDocument() {
     const match = location.hash.match(/^#(customerorder|demand|cashin|paymentin)\/edit\?[^#]*\bid=([0-9a-f-]+)/i);
@@ -4808,9 +4815,31 @@ function reconcileMsEnhancements() {
     if (typeof buildMsFieldsSpoiler === 'function') buildMsFieldsSpoiler();
 }
 
+function msQuickPanelIsHealthy() {
+    if (!/online\.moysklad\.ru$/.test(location.hostname) || !msQuickPanelEnabled) return true;
+    const kind = Object.keys(MS_QUICK_PANEL_CONFIG).find(k => MS_QUICK_PANEL_CONFIG[k].marker());
+    if (!kind) return true;
+    const cfg = MS_QUICK_PANEL_CONFIG[kind];
+    const panel = document.getElementById('mcQuickPanel');
+    const signature = [...cfg.create, ...cfg.print].join('\u001f');
+    const quickEnabled = HACKER_QUICK_API_ROW_ENABLED && hackerQuickButtonsEnabled;
+    return !!panel && panel.isConnected && panel.dataset.kind === kind
+        && panel.dataset.quickSignature === signature
+        && panel.querySelectorAll('button').length === cfg.create.length + cfg.print.length
+        && (!quickEnabled || document.getElementById('mcHackerQuickRow')?.isConnected);
+}
+
+function startMsQuickPanelKeepalive() {
+    if (msQuickKeepaliveTimer) return;
+    msQuickKeepaliveTimer = setInterval(() => {
+        if (!msQuickPanelIsHealthy()) buildMsQuickPanel();
+    }, 1000);
+}
+
 function startMsSpaObserver() {
     if (!/online\.moysklad\.ru$/.test(location.hostname) || msSpaObserver) return;
     reconcileMsEnhancements();
+    startMsQuickPanelKeepalive();
     msSpaObserver = new MutationObserver(() => {
         clearTimeout(msSpaReconcileTimer);
         msSpaReconcileTimer = setTimeout(reconcileMsEnhancements, 350);
