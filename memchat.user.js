@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.0.1
+// @version      8.1.0-beta
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.0.1';
+const MEMCHAT_VERSION = '8.1.0-beta';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -163,13 +163,27 @@ let msQuickObserver = null;
 const MS_QUICK_PANEL_CONFIG = {
     customerorder: {
         marker: () => /^#customerorder\/edit/.test(location.hash),
+        magic: false,
         create: ['Отгрузка', 'Входящий платеж', 'Приходный ордер'],
         print: ['[Сервис] Приемная квитанция A4 x2', '[Сервис] Товарный чек', '[Сервис] Договор купли-продажи +акт']
     },
     demand: {
         marker: () => /^#demand\/edit/.test(location.hash),
+        magic: true,
         create: ['Входящий платеж', 'Приходный ордер', 'Возврат покупателя'],
         print: ['Товарный чек 5%', 'Товарный чек Патент', '[Сервис] Товарный чек А4', '[Сервис] Квитанция на б/у']
+    },
+    cashin: {
+        marker: () => /^#cashin\/edit/.test(location.hash),
+        magic: true,
+        create: ['Отгрузка', 'Входящий платеж'],
+        print: []
+    },
+    paymentin: {
+        marker: () => /^#paymentin\/edit/.test(location.hash),
+        magic: true,
+        create: ['Отгрузка', 'Приходный ордер'],
+        print: []
     }
 };
 
@@ -1975,11 +1989,13 @@ function buildMsQuickPanel() {
     const oldQuickRow = document.getElementById('mcHackerQuickRow');
     const kind = Object.keys(MS_QUICK_PANEL_CONFIG).find(k => MS_QUICK_PANEL_CONFIG[k].marker());
     const cfg = kind ? MS_QUICK_PANEL_CONFIG[kind] : null;
-    const quickSignature = cfg ? [...cfg.create, ...cfg.print].join('\u001f') : '';
+    const quickSignature = cfg ? [cfg.magic ? 'magic' : '', ...cfg.create, ...cfg.print].join('\u001f') : '';
+    const expectedButtonCount = cfg ? cfg.create.length + cfg.print.length + (cfg.magic ? 1 : 0) : 0;
     const quickEnabled = HACKER_QUICK_API_ROW_ENABLED && hackerQuickButtonsEnabled;
     const panelHealthy = old && old.isConnected && old.dataset.kind === kind
         && old.dataset.quickSignature === quickSignature
-        && old.querySelectorAll('button').length === (cfg ? cfg.create.length + cfg.print.length : 0)
+        && old.querySelectorAll('button').length === expectedButtonCount
+        && (!cfg?.magic || old.querySelector('#mcMagicPanelAction')?.isConnected)
         && (!quickEnabled || oldQuickRow?.isConnected);
     // Keep a complete pair stable across MutationObserver callbacks.
     if (panelHealthy) return;
@@ -2023,6 +2039,19 @@ function buildMsQuickPanel() {
         return b;
     };
 
+    if (cfg.magic) {
+        const magic = document.createElement('button');
+        magic.id = 'mcMagicPanelAction';
+        magic.type = 'button';
+        magic.textContent = '🪄 Заполнить';
+        magic.title = 'Заполнить настроенные поля и сохранить документ';
+        magic.style.cssText = 'padding:3px 8px;border:1px solid #c4b5fd;border-radius:6px;background:#f5f3ff;'
+            + 'color:#6d28d9;font-size:11px;cursor:pointer;white-space:nowrap;transition:all .15s;';
+        magic.addEventListener('mouseenter', () => { magic.style.background = '#ede9fe'; magic.style.borderColor = '#8b5cf6'; });
+        magic.addEventListener('mouseleave', () => { magic.style.background = '#f5f3ff'; magic.style.borderColor = '#c4b5fd'; });
+        magic.addEventListener('click', () => openMsMagicPopup(magic));
+        panel.appendChild(magic);
+    }
     cfg.create.forEach(label => panel.appendChild(mkBtn('➕', label, 'Создать документ')));
     cfg.print.forEach(label => panel.appendChild(mkBtn('🖨', label, 'Печать')));
 
@@ -3295,7 +3324,7 @@ function initialize() {
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v8.0.1 инициализирован');
+    console.log('Мемный чат v8.1.0-beta инициализирован');
 
     // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
     if (/online\.moysklad\.ru$/.test(location.hostname)) {
@@ -4801,29 +4830,9 @@ function openMsMagicPopup(anchor) {
 
 function buildMsMagicFillAction() {
     const existing = document.getElementById('mcMagicFillAction');
-    const doc = msCurrentDocument();
-    if (!doc || !['demand', 'cashin', 'paymentin'].includes(doc.type)) {
-        existing?.remove();
-        closeMsMagicPopup();
-        return;
-    }
-    if (existing?.isConnected && existing.dataset.kind === doc.type) return;
+    // До 8.0.2-beta палочка жила рядом с первым настроенным полем. Удаляем
+    // оставшийся DOM старой версии: теперь она строится в общей quick-панели.
     if (existing) { existing.remove(); closeMsMagicPopup(); }
-    const section = msMagicConfig[doc.type] || {};
-    const names = [...(section.copies || []), ...(section.values || [])].map(rule => rule.field);
-    const anchorHost = names.flatMap(msFindFieldHosts).find(msVisible);
-    const anchor = msFieldControl(anchorHost) || anchorHost;
-    if (!anchor) return;
-    const button = document.createElement('button');
-    button.id = 'mcMagicFillAction';
-    button.dataset.kind = doc.type;
-    button.type = 'button';
-    button.textContent = '🪄';
-    button.title = 'Заполнить настроенные поля и сохранить документ';
-    button.style.cssText = 'display:inline-block;margin-left:5px;padding:3px 7px;border:1px solid #c4b5fd;border-radius:6px;'
-        + 'background:#f5f3ff;color:#6d28d9;cursor:pointer;vertical-align:middle;';
-    button.addEventListener('click', () => openMsMagicPopup(button));
-    anchor.insertAdjacentElement('afterend', button);
 }
 
 function buildMsFieldsSpoiler() {
@@ -4876,11 +4885,13 @@ function msQuickPanelIsHealthy() {
     if (!kind) return true;
     const cfg = MS_QUICK_PANEL_CONFIG[kind];
     const panel = document.getElementById('mcQuickPanel');
-    const signature = [...cfg.create, ...cfg.print].join('\u001f');
+    const signature = [cfg.magic ? 'magic' : '', ...cfg.create, ...cfg.print].join('\u001f');
     const quickEnabled = HACKER_QUICK_API_ROW_ENABLED && hackerQuickButtonsEnabled;
+    const expectedButtonCount = cfg.create.length + cfg.print.length + (cfg.magic ? 1 : 0);
     return !!panel && panel.isConnected && panel.dataset.kind === kind
         && panel.dataset.quickSignature === signature
-        && panel.querySelectorAll('button').length === cfg.create.length + cfg.print.length
+        && panel.querySelectorAll('button').length === expectedButtonCount
+        && (!cfg.magic || panel.querySelector('#mcMagicPanelAction')?.isConnected)
         && (!quickEnabled || document.getElementById('mcHackerQuickRow')?.isConnected);
 }
 
