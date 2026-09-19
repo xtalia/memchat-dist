@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.1.0-beta
+// @version      8.2.8-beta
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.1.0-beta';
+const MEMCHAT_VERSION = '8.2.8-beta';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -120,6 +120,21 @@ let hackerBearerToken = '';
 let hackerApiValidated = false;
 let hackerDefaultChannel = '';
 let hackerQuickButtonsEnabled = true;
+const HACKER_NOTIFIER_AUDIO_URL = 'https://www.myinstants.com/media/sounds/fnaf-animatronic-at-door.mp3';
+const HACKER_NOTIFIER_DEFAULT_INTERVAL_MINUTES = 5;
+let hackerNotifierSettings = {
+    enabled: true,
+    soundEnabled: true,
+    intervalMinutes: HACKER_NOTIFIER_DEFAULT_INTERVAL_MINUTES,
+    organizationHref: '',
+    statusHrefs: []
+};
+let hackerNotifierOrganizations = [];
+let hackerNotifierSeenByOrganization = {};
+let hackerNotifierStatusSelectionInitialized = false;
+let hackerNotifierTimer = null;
+let hackerNotifierInFlight = false;
+let hackerNotifierAudio = null;
 // Экспериментальные API-кнопки создания документов временно скрыты.
 // Рабочая панель, нажимающая штатные пункты меню МойСклад, остаётся включённой.
 const HACKER_QUICK_API_ROW_ENABLED = false;
@@ -231,7 +246,8 @@ function installDebugHandlers() {
         debugError('uncaught', event.error || event.message, event.filename, event.lineno);
     });
     window.addEventListener('unhandledrejection', event => {
-        debugError('promise', event.reason);
+        const reason = event.reason;
+        debugError('promise', reason?.stack || reason?.message || reason);
     });
 }
 
@@ -2713,7 +2729,8 @@ function buildSettingsSnapshot() {
         hatikoSearchMode,
         retryBehavior,
         msQuickPanelEnabled,
-        msMagicConfig
+        msMagicConfig,
+        hackerOrderNotifier: hackerNotifierSettings
     };
 }
 
@@ -2804,6 +2821,13 @@ function importSettings(jsonText) {
             return false;
         }
     }
+    if (data.hackerOrderNotifier && typeof data.hackerOrderNotifier === 'object') {
+        hackerNotifierSettings = hackerNotifierNormalizeSettings(data.hackerOrderNotifier);
+        hackerNotifierStatusSelectionInitialized = true;
+        hackerNotifierSaveSettings();
+        hackerNotifierFillControls();
+        hackerNotifierMaybeStart();
+    }
 
     const area = document.getElementById('mcImportArea');
     const actions = document.getElementById('mcImportActions');
@@ -2821,7 +2845,7 @@ function renderHackerInlineTab() {
     const tabs = document.createElement('div');
     tabs.id = 'hackerTabs';
     tabs.style.cssText = 'display:flex;gap:4px;flex:0 0 auto;';
-    [['status', 'Статус'], ['agent', 'Контрагент'], ['sale', 'Автопродажа']].forEach(([key, label]) => {
+    [['status', 'Статус'], ['agent', 'Контрагент'], ['sale', 'Автопродажа'], ['notifier', 'Новые заказы'], ['internalOrderCheck', 'Проверка товаров']].forEach(([key, label]) => {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.textContent = label;
@@ -2884,7 +2908,9 @@ function openHackerWindow() {
     const HACKER_TABS = [
         ['status', 'Статус'],
         ['agent', 'Контрагент'],
-        ['sale', 'Автопродажа']
+        ['sale', 'Автопродажа'],
+        ['notifier', 'Новые заказы'],
+        ['internalOrderCheck', 'Проверка товаров']
     ];
     HACKER_TABS.forEach(([key, label], i) => {
         const btn = document.createElement('button');
@@ -2942,6 +2968,8 @@ function hackerSelectTab(key) {
     if (key === 'status') pane = hackerBuildStatusTab();
     else if (key === 'agent') pane = hackerBuildAgentTab();
     else if (key === 'sale') pane = hackerBuildSaleTab();
+    else if (key === 'notifier') pane = hackerBuildNotifierTab();
+    else if (key === 'internalOrderCheck') pane = hackerBuildInternalOrderCheckTab();
     if (pane) panes.appendChild(pane);
 
     // Справочники загружаются при открытии соответствующей вкладки.
@@ -3324,7 +3352,7 @@ function initialize() {
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v8.1.0-beta инициализирован');
+    console.log('Мемный чат v8.2.8-beta инициализирован');
 
     // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
     if (/online\.moysklad\.ru$/.test(location.hostname)) {
@@ -3371,6 +3399,7 @@ function hackerLoadSettings() {
         hackerBearerToken = '';
     }
     hackerLoadCachedStates();
+    hackerNotifierLoadSettings();
 }
 
 function hackerLoadCachedStates() {
@@ -3452,9 +3481,11 @@ function hackerValidateApiKey(onDone) {
         hackerSaveStates();
         hackerUpdateBearerStatus(response?._status || 200, 'валиден');
         hackerSyncAccessUi();
+        hackerNotifierMaybeStart();
         onDone?.(true);
     }, error => {
         hackerApiValidated = false;
+        hackerNotifierStop();
         hackerUpdateBearerStatus(error?.status || 401, 'ошибка');
         hackerSyncAccessUi();
         onDone?.(false);
@@ -4911,6 +4942,1021 @@ function startMsSpaObserver() {
         msSpaReconcileTimer = setTimeout(reconcileMsEnhancements, 350);
     });
     msSpaObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+/* ===== 13-order-notifier.js ===== */
+
+// ─── Оповещатель новых заказов ────────────────────────────────────────────────
+// Периодически проверяет customerorder выбранной организации и подаёт сигнал
+// на каждом опросе, если есть заказ в одном из выбранных статусов.
+
+function hackerNotifierNormalizeSettings(raw) {
+    const interval = Number(raw?.intervalMinutes);
+    return {
+        enabled: raw?.enabled !== false,
+        soundEnabled: raw?.soundEnabled !== false,
+        intervalMinutes: Number.isFinite(interval)
+            ? Math.min(1440, Math.max(1, Math.round(interval)))
+            : HACKER_NOTIFIER_DEFAULT_INTERVAL_MINUTES,
+        organizationHref: typeof raw?.organizationHref === 'string' ? raw.organizationHref : '',
+        statusHrefs: Array.isArray(raw?.statusHrefs)
+            ? [...new Set(raw.statusHrefs.filter(value => typeof value === 'string' && value))]
+            : []
+    };
+}
+
+function hackerNotifierLoadSettings() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(storageKey('hackerOrderNotifier_v1')) || '{}');
+        hackerNotifierSettings = hackerNotifierNormalizeSettings(raw);
+        hackerNotifierStatusSelectionInitialized = Array.isArray(raw?.statusHrefs);
+        const organizations = JSON.parse(localStorage.getItem(storageKey('hackerNotifierOrganizations_v1')) || '[]');
+        hackerNotifierOrganizations = Array.isArray(organizations)
+            ? organizations.filter(item => item && typeof item.href === 'string' && typeof item.name === 'string')
+            : [];
+        const seen = JSON.parse(localStorage.getItem(storageKey('hackerNotifierSeen_v1')) || '{}');
+        hackerNotifierSeenByOrganization = seen && typeof seen === 'object' ? seen : {};
+    } catch (error) {
+        hackerNotifierSettings = hackerNotifierNormalizeSettings({});
+        hackerNotifierOrganizations = [];
+        hackerNotifierSeenByOrganization = {};
+        hackerNotifierStatusSelectionInitialized = false;
+        debugError('hacker-notifier', 'Не удалось загрузить настройки', error);
+    }
+}
+
+function hackerNotifierSaveSettings() {
+    try {
+        localStorage.setItem(storageKey('hackerOrderNotifier_v1'), JSON.stringify(hackerNotifierSettings));
+    } catch (error) {
+        debugError('hacker-notifier', 'Не удалось сохранить настройки', error);
+    }
+}
+
+function hackerNotifierSaveOrganizations() {
+    try {
+        localStorage.setItem(storageKey('hackerNotifierOrganizations_v1'), JSON.stringify(hackerNotifierOrganizations));
+    } catch (error) {
+        debugError('hacker-notifier', 'Не удалось сохранить организации', error);
+    }
+}
+
+function hackerNotifierSaveSeen() {
+    try {
+        localStorage.setItem(storageKey('hackerNotifierSeen_v1'), JSON.stringify(hackerNotifierSeenByOrganization));
+    } catch (error) {
+        debugError('hacker-notifier', 'Не удалось сохранить историю заказов', error);
+    }
+}
+
+function hackerNotifierSetStatus(message, kind = 'info') {
+    const el = document.getElementById('hackerNotifierStatus');
+    if (!el) return;
+    el.textContent = message;
+    el.style.color = kind === 'error' ? '#b91c1c' : kind === 'ok' ? '#166534' : '#64748b';
+}
+
+function hackerNotifierFillControls() {
+    const organization = document.getElementById('hackerNotifierOrganization');
+    if (organization) {
+        const selected = hackerNotifierSettings.organizationHref;
+        organization.innerHTML = '';
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = '— выберите организацию —';
+        organization.appendChild(empty);
+        hackerNotifierOrganizations.forEach(item => {
+            const option = document.createElement('option');
+            option.value = item.href;
+            option.textContent = item.name;
+            organization.appendChild(option);
+        });
+        organization.value = selected;
+    }
+
+    const statuses = document.getElementById('hackerNotifierStatuses');
+    if (statuses) {
+        statuses.innerHTML = '';
+        hackerStates.forEach(item => {
+            const option = document.createElement('option');
+            option.value = item.href;
+            option.textContent = item.name;
+            option.selected = hackerNotifierSettings.statusHrefs.includes(item.href);
+            statuses.appendChild(option);
+        });
+    }
+    const enabled = document.getElementById('hackerNotifierEnabled');
+    if (enabled) enabled.checked = hackerNotifierSettings.enabled;
+    const soundEnabled = document.getElementById('hackerNotifierSoundEnabled');
+    if (soundEnabled) soundEnabled.checked = hackerNotifierSettings.soundEnabled;
+    const interval = document.getElementById('hackerNotifierInterval');
+    if (interval) interval.value = String(hackerNotifierSettings.intervalMinutes);
+}
+
+function hackerNotifierSelectDefaultStatus() {
+    if (hackerNotifierStatusSelectionInitialized || !hackerStates.length) return;
+    const fresh = hackerStates.find(item => String(item.name || '').trim().toLowerCase() === 'новый');
+    if (fresh) {
+        hackerNotifierSettings.statusHrefs = [fresh.href];
+        hackerNotifierStatusSelectionInitialized = true;
+        hackerNotifierSaveSettings();
+    }
+}
+
+function hackerNotifierRefreshOrganizations(quiet = false) {
+    return msApiP('GET', '/entity/organization?order=name&limit=100')
+        .then(data => {
+            hackerNotifierOrganizations = (Array.isArray(data?.rows) ? data.rows : [])
+                .map(item => ({ name: item.name, href: item.meta?.href }))
+                .filter(item => item.name && item.href);
+            hackerNotifierSaveOrganizations();
+            hackerNotifierFillControls();
+            if (!quiet) hackerLog(`Организации обновлены: ${hackerNotifierOrganizations.length} шт.`, 'ok');
+            return hackerNotifierOrganizations;
+        })
+        .catch(error => {
+            if (!quiet) hackerLog('Организации: ' + error.message, 'err');
+            hackerNotifierSetStatus('⚠️ Не удалось загрузить организации', 'error');
+            return hackerNotifierOrganizations;
+        });
+}
+
+function hackerNotifierPlayAlarm() {
+    try {
+        if (!hackerNotifierAudio) hackerNotifierAudio = new Audio(HACKER_NOTIFIER_AUDIO_URL);
+        hackerNotifierAudio.currentTime = 0;
+        const result = hackerNotifierAudio.play();
+        if (result?.catch) result.catch(() => {
+            hackerNotifierSetStatus('⚠️ Браузер заблокировал звук — нажмите «Тест сигнала»', 'error');
+            hackerLog('Звук заблокирован браузером; разрешите воспроизведение кнопкой «Тест сигнала»', 'warn');
+        });
+    } catch (error) {
+        hackerLog('Звук: ' + error.message, 'err');
+    }
+}
+
+function hackerNotifierEnsureIndicator() {
+    let indicator = document.getElementById('hackerNotifierIndicator');
+    if (!hackerNotifierTimer) {
+        indicator?.remove();
+        return;
+    }
+    if (indicator) return;
+    indicator = document.createElement('span');
+    indicator.id = 'hackerNotifierIndicator';
+    indicator.textContent = '🐻';
+    indicator.title = 'Оповещатель новых заказов включён';
+    indicator.setAttribute('aria-label', indicator.title);
+    indicator.style.cssText = 'position:fixed;right:14px;bottom:12px;z-index:2147483000;'
+        + 'font-size:18px;line-height:1;opacity:.28;filter:grayscale(.35);'
+        + 'pointer-events:none;user-select:none;transition:opacity .2s,filter .2s;';
+    document.body.appendChild(indicator);
+}
+
+function hackerNotifierOrderUrl(order) {
+    const id = order?.id;
+    if (!id) return '';
+    const origin = /(^|\.)online\.moysklad\.ru$/i.test(location.hostname)
+        ? location.origin
+        : 'https://online.moysklad.ru';
+    return `${origin}/app/#customerorder/edit?id=${encodeURIComponent(id)}`;
+}
+
+function hackerNotifierShowToast(order) {
+    let host = document.getElementById('hackerNotifierToastHost');
+    if (!host) {
+        host = document.createElement('div');
+        host.id = 'hackerNotifierToastHost';
+        host.style.cssText = 'position:fixed;top:18px;right:18px;z-index:2147483002;'
+            + 'display:flex;flex-direction:column;align-items:flex-end;gap:8px;'
+            + 'width:min(360px,calc(100vw - 36px));pointer-events:none;';
+        document.body.appendChild(host);
+    }
+
+    const toast = document.createElement('div');
+    toast.className = 'hacker-notifier-toast';
+    const lifetime = hackerNotifierSettings.soundEnabled ? 5000 : 30000;
+    toast.dataset.dismissMs = String(lifetime);
+    toast.style.cssText = 'box-sizing:border-box;width:100%;padding:11px 13px 12px;'
+        + 'background:linear-gradient(145deg,#111827,#1f2937);'
+        + 'border:1px solid rgba(248,113,113,.72);border-left:4px solid #ef4444;'
+        + 'border-radius:10px;box-shadow:0 10px 28px rgba(2,6,23,.35);'
+        + 'color:#f8fafc;font:12px/1.35 Segoe UI,sans-serif;pointer-events:auto;'
+        + 'opacity:0;transform:translateX(22px);transition:opacity .18s ease,transform .18s ease;';
+
+    const title = document.createElement('div');
+    title.style.cssText = 'font-weight:800;font-size:13px;letter-spacing:.25px;color:#fecaca;';
+    title.textContent = '⚠️ 🐻🔴 НОВЫЙ ЗАКАЗ';
+    const name = document.createElement('div');
+    name.style.cssText = 'margin-top:5px;font-weight:700;color:#fff;';
+    const orderUrl = hackerNotifierOrderUrl(order);
+    if (orderUrl) {
+        const link = document.createElement('a');
+        link.href = orderUrl;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = order?.name || order?.id || 'Без номера';
+        link.title = 'Открыть заказ в новой вкладке';
+        link.style.cssText = 'color:#fff;text-decoration:underline;text-decoration-color:#f87171;'
+            + 'text-underline-offset:2px;cursor:pointer;';
+        name.appendChild(link);
+    } else {
+        name.textContent = order?.name || 'Без номера';
+    }
+    const status = document.createElement('div');
+    status.style.cssText = 'margin-top:2px;color:#cbd5e1;';
+    status.textContent = `Статус: ${order?.stateName || 'Новый'}`;
+    toast.append(title, name, status);
+
+    let closed = false;
+    let paused = false;
+    let dismissTimer = null;
+    let remaining = lifetime;
+    let timerStartedAt = Date.now();
+    const removeToast = () => {
+        if (closed) return;
+        closed = true;
+        if (dismissTimer) window.clearTimeout(dismissTimer);
+        toast.remove();
+        if (!host.children.length) host.remove();
+    };
+    const fadeToast = () => {
+        if (closed) return;
+        closed = true;
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(22px)';
+        window.setTimeout(() => {
+            toast.remove();
+            if (!host.children.length) host.remove();
+        }, 220);
+    };
+    const scheduleDismiss = () => {
+        if (closed || paused) return;
+        timerStartedAt = Date.now();
+        dismissTimer = window.setTimeout(fadeToast, remaining);
+    };
+    toast.addEventListener('mouseenter', () => {
+        if (closed || paused) return;
+        paused = true;
+        toast.dataset.timerPaused = 'true';
+        if (dismissTimer) window.clearTimeout(dismissTimer);
+        remaining = Math.max(0, remaining - (Date.now() - timerStartedAt));
+    });
+    toast.addEventListener('mouseleave', () => {
+        if (closed || !paused) return;
+        paused = false;
+        toast.dataset.timerPaused = 'false';
+        scheduleDismiss();
+    });
+    if (!hackerNotifierSettings.soundEnabled) {
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.textContent = '✕';
+        close.title = 'Закрыть уведомление';
+        close.style.cssText = 'position:absolute;top:5px;right:7px;padding:0;border:0;'
+            + 'background:transparent;color:#fecaca;font-size:15px;line-height:1;cursor:pointer;';
+        close.addEventListener('click', removeToast);
+        toast.style.position = 'relative';
+        toast.appendChild(close);
+
+        const closeButton = document.createElement('button');
+        closeButton.type = 'button';
+        closeButton.textContent = 'Закрыть';
+        closeButton.style.cssText = 'margin-top:8px;padding:3px 8px;border:1px solid #64748b;'
+            + 'border-radius:5px;background:#334155;color:#f8fafc;font-size:10px;cursor:pointer;';
+        closeButton.addEventListener('click', removeToast);
+        toast.appendChild(closeButton);
+    }
+    host.appendChild(toast);
+
+    requestAnimationFrame(() => {
+        toast.style.opacity = '1';
+        toast.style.transform = 'translateX(0)';
+    });
+    scheduleDismiss();
+}
+
+function hackerNotifierTrace(message, details = null, kind = 'info') {
+    const prefix = '[Memchat:notifier]';
+    if (kind === 'error') console.error(prefix, message, details || '');
+    else if (kind === 'warn') console.warn(prefix, message, details || '');
+    else console.info(prefix, message, details || '');
+    hackerLog(`🔎 ${message}`, kind === 'error' ? 'err' : kind);
+}
+
+function hackerNotifierSelectedStatusNames() {
+    return hackerNotifierSettings.statusHrefs
+        .map(href => hackerStates.find(state => state.href === href)?.name)
+        .filter(Boolean);
+}
+
+function hackerNotifierPoll() {
+    if (hackerNotifierInFlight) {
+        hackerNotifierTrace('Проверка пропущена: предыдущий запрос ещё выполняется', null, 'warn');
+        return Promise.resolve([]);
+    }
+    if (!hackerNotifierSettings.enabled) {
+        hackerNotifierTrace('Проверка пропущена: оповещатель выключен', null, 'warn');
+        return Promise.resolve([]);
+    }
+    if (!hackerNotifierSettings.organizationHref) {
+        hackerNotifierTrace('Проверка пропущена: организация не выбрана', null, 'warn');
+        return Promise.resolve([]);
+    }
+    if (!hackerNotifierSettings.statusHrefs.length) {
+        hackerNotifierTrace('Проверка пропущена: статусы для оповещения не выбраны', null, 'warn');
+        return Promise.resolve([]);
+    }
+    if (!hackerApiValidated) {
+        hackerNotifierTrace('Проверка пропущена: API-ключ ещё не подтверждён', null, 'warn');
+        return Promise.resolve([]);
+    }
+    hackerNotifierInFlight = true;
+    const organizationHref = hackerNotifierSettings.organizationHref;
+    const filter = encodeURIComponent('organization=' + organizationHref);
+    const path = `/entity/customerorder?filter=${filter}&expand=state&order=moment,desc&limit=100`;
+    const selectedStatusNames = hackerNotifierSelectedStatusNames();
+    hackerNotifierTrace('Запрос заказов', {
+        organizationHref,
+        statusHrefs: hackerNotifierSettings.statusHrefs,
+        statusNames: selectedStatusNames,
+        path
+    });
+    return msApiP('GET', path)
+        .then(data => {
+            const rows = Array.isArray(data?.rows) ? data.rows : [];
+            const saved = hackerNotifierSeenByOrganization[organizationHref];
+            const bucket = saved && typeof saved === 'object' && saved.orders && typeof saved.orders === 'object'
+                ? saved
+                : { initialized: false, orders: {} };
+            const matchingOrders = [];
+            const stateCounts = {};
+
+            rows.forEach(order => {
+                const id = order?.id || order?.meta?.href;
+                if (!id) return;
+                const stateHref = order.state?.meta?.href || '';
+                const stateName = order.state?.name || 'без статуса';
+                const stateKey = `${stateName} [${stateHref || 'без href'}]`;
+                stateCounts[stateKey] = (stateCounts[stateKey] || 0) + 1;
+                const matchesByHref = hackerNotifierSettings.statusHrefs.includes(stateHref);
+                const matchesByName = selectedStatusNames.some(name =>
+                    String(name).trim().toLowerCase() === String(stateName).trim().toLowerCase());
+                const matches = matchesByHref || matchesByName;
+                if (matches) matchingOrders.push({ id, name: order.name || id, stateName, stateHref });
+                bucket.orders[id] = { stateHref, stateName, updatedAt: Date.now() };
+            });
+
+            bucket.initialized = true;
+            bucket.orders = Object.fromEntries(Object.entries(bucket.orders)
+                .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+                .slice(0, 500));
+            hackerNotifierSeenByOrganization[organizationHref] = bucket;
+            hackerNotifierSaveSeen();
+
+            hackerNotifierTrace('Ответ получен', {
+                httpStatus: data?._status || 'unknown',
+                totalRows: rows.length,
+                stateCounts,
+                matchingOrders: matchingOrders.map(order => ({
+                    id: order.id,
+                    name: order.name,
+                    stateName: order.stateName,
+                    stateHref: order.stateHref
+                }))
+            });
+            if (matchingOrders.length) {
+                matchingOrders.forEach(order => {
+                    hackerLog(`🔔 Заказ ${order.name} — ${order.stateName}`, 'ok');
+                    hackerNotifierShowToast(order);
+                });
+                if (hackerNotifierSettings.soundEnabled) hackerNotifierPlayAlarm();
+                hackerNotifierSetStatus(`🔔 Заказов в выбранных статусах: ${matchingOrders.length}`, 'ok');
+            } else {
+                hackerNotifierTrace('Совпадений по выбранным статусам нет', {
+                    totalRows: rows.length,
+                    selectedStatusNames,
+                    selectedStatusHrefs: hackerNotifierSettings.statusHrefs
+                }, 'warn');
+                hackerNotifierSetStatus(`Проверено: ${new Date().toLocaleTimeString()} — совпадений нет`, 'info');
+            }
+            return matchingOrders;
+        })
+        .catch(error => {
+            hackerNotifierTrace('Ошибка запроса', { message: error?.message || String(error), error }, 'error');
+            hackerNotifierSetStatus('⚠️ Ошибка проверки: ' + error.message, 'error');
+            return [];
+        })
+        .finally(() => { hackerNotifierInFlight = false; });
+}
+
+function hackerNotifierStop() {
+    if (hackerNotifierTimer) clearInterval(hackerNotifierTimer);
+    hackerNotifierTimer = null;
+    hackerNotifierEnsureIndicator();
+}
+
+function hackerNotifierStart() {
+    hackerNotifierStop();
+    if (!hackerApiValidated || !hackerNotifierSettings.enabled || !hackerNotifierSettings.organizationHref) return;
+    hackerNotifierTimer = setInterval(hackerNotifierPoll, hackerNotifierSettings.intervalMinutes * 60 * 1000);
+    hackerNotifierEnsureIndicator();
+    hackerNotifierTrace('Таймер запущен', {
+        intervalMinutes: hackerNotifierSettings.intervalMinutes,
+        organizationHref: hackerNotifierSettings.organizationHref,
+        statusHrefs: hackerNotifierSettings.statusHrefs,
+        statusNames: hackerNotifierSelectedStatusNames()
+    });
+}
+
+function hackerNotifierMaybeStart() {
+    hackerNotifierSelectDefaultStatus();
+    hackerNotifierStart();
+}
+
+function hackerNotifierReadControls() {
+    const enabled = document.getElementById('hackerNotifierEnabled');
+    const soundEnabled = document.getElementById('hackerNotifierSoundEnabled');
+    const organization = document.getElementById('hackerNotifierOrganization');
+    const statuses = document.getElementById('hackerNotifierStatuses');
+    const interval = document.getElementById('hackerNotifierInterval');
+    hackerNotifierSettings = hackerNotifierNormalizeSettings({
+        enabled: enabled?.checked,
+        soundEnabled: soundEnabled ? soundEnabled.checked : hackerNotifierSettings.soundEnabled,
+        organizationHref: organization?.value || '',
+        statusHrefs: statuses ? [...statuses.selectedOptions].map(option => option.value) : hackerNotifierSettings.statusHrefs,
+        intervalMinutes: interval?.value
+    });
+    hackerNotifierStatusSelectionInitialized = true;
+    hackerNotifierSaveSettings();
+    hackerNotifierMaybeStart();
+}
+
+function hackerBuildNotifierTab() {
+    const wrap = hackerEl('div');
+    wrap.id = 'hackerTabNotifier';
+
+    wrap.appendChild(hackerEl('div', 'font-size:11px;color:#64748b;line-height:1.4;margin-bottom:7px;',
+        'Проверяет заказы выбранной организации по таймеру и подаёт сигнал на каждом опросе, пока заказ находится в выбранном статусе.'));
+
+    const enabledLabel = hackerEl('label', 'display:flex;align-items:center;gap:7px;font-size:11.5px;color:#475569;margin-bottom:7px;cursor:pointer;');
+    const enabled = document.createElement('input');
+    enabled.type = 'checkbox';
+    enabled.id = 'hackerNotifierEnabled';
+    enabled.style.accentColor = '#6366f1';
+    enabledLabel.appendChild(enabled);
+    enabledLabel.appendChild(document.createTextNode('Включить оповещатель'));
+    wrap.appendChild(enabledLabel);
+
+    const soundLabel = hackerEl('label', 'display:flex;align-items:center;gap:7px;font-size:11.5px;color:#475569;margin-bottom:7px;cursor:pointer;');
+    const soundEnabled = document.createElement('input');
+    soundEnabled.type = 'checkbox';
+    soundEnabled.id = 'hackerNotifierSoundEnabled';
+    soundEnabled.style.accentColor = '#dc2626';
+    soundLabel.appendChild(soundEnabled);
+    soundLabel.appendChild(document.createTextNode('🔊 Звуковой сигнал'));
+    wrap.appendChild(soundLabel);
+
+    const orgRow = hackerEl('div', 'display:flex;gap:4px;margin-bottom:6px;');
+    const organization = hackerSelect('hackerNotifierOrganization', '— выберите организацию —');
+    organization.style.cssText = HACKER_SELECT_CSS;
+    orgRow.appendChild(organization);
+    const refreshOrg = hackerBtn('hackerNotifierOrganizationsRefresh', '⟳', HACKER_MINI_BTN_CSS);
+    refreshOrg.title = 'Обновить список организаций';
+    orgRow.appendChild(refreshOrg);
+    wrap.appendChild(orgRow);
+
+    const statusesLabel = hackerEl('label', 'display:block;font-size:11.5px;color:#475569;margin-bottom:6px;', 'Статусы для оповещения:');
+    const statuses = document.createElement('select');
+    statuses.id = 'hackerNotifierStatuses';
+    statuses.multiple = true;
+    statuses.size = 4;
+    statuses.style.cssText = 'display:block;width:100%;margin-top:3px;padding:4px 6px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;';
+    statusesLabel.appendChild(statuses);
+    wrap.appendChild(statusesLabel);
+
+    const intervalLabel = hackerEl('label', 'display:flex;align-items:center;gap:5px;font-size:11.5px;color:#475569;margin:5px 0 7px;', 'Интервал, минут:');
+    const interval = document.createElement('input');
+    interval.id = 'hackerNotifierInterval';
+    interval.type = 'number';
+    interval.min = '1';
+    interval.max = '1440';
+    interval.step = '1';
+    interval.style.cssText = 'width:70px;padding:4px 6px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;';
+    intervalLabel.appendChild(interval);
+    wrap.appendChild(intervalLabel);
+
+    const buttons = hackerEl('div', 'display:flex;gap:4px;flex-wrap:wrap;');
+    const save = hackerBtn('hackerNotifierSave', '💾 Сохранить и запустить', HACKER_BTN_CSS + 'background:#4f46e5;');
+    const poll = hackerBtn('hackerNotifierPollNow', '⟳ Проверить сейчас', HACKER_MINI_BTN_CSS);
+    const sound = hackerBtn('hackerNotifierTestSound', '🔊 Тест сигнала', HACKER_MINI_BTN_CSS);
+    buttons.append(save, poll, sound);
+    wrap.appendChild(buttons);
+    const status = hackerEl('div', 'min-height:16px;margin-top:6px;font-size:10.5px;', '');
+    status.id = 'hackerNotifierStatus';
+    wrap.appendChild(status);
+
+    hackerNotifierFillControls();
+    enabled.addEventListener('change', hackerNotifierReadControls);
+    soundEnabled.addEventListener('change', hackerNotifierReadControls);
+    organization.addEventListener('change', hackerNotifierReadControls);
+    statuses.addEventListener('change', hackerNotifierReadControls);
+    interval.addEventListener('input', hackerNotifierReadControls);
+    interval.addEventListener('change', hackerNotifierReadControls);
+    save.addEventListener('click', () => { hackerNotifierReadControls(); hackerNotifierPoll(); });
+    poll.addEventListener('click', () => { hackerNotifierReadControls(); hackerNotifierPoll(); });
+    sound.addEventListener('click', hackerNotifierPlayAlarm);
+    refreshOrg.addEventListener('click', () => hackerNotifierRefreshOrganizations(false));
+
+    hackerNotifierSelectDefaultStatus();
+    hackerNotifierFillControls();
+    Promise.all([hackerEnsureStates(true), hackerNotifierRefreshOrganizations(true)]).then(() => {
+        hackerNotifierSelectDefaultStatus();
+        hackerNotifierFillControls();
+    }).catch(error => {
+        hackerNotifierSetStatus('⚠️ Не удалось загрузить настройки оповещателя', 'error');
+        hackerLog('Оповещатель: ' + error.message, 'err');
+    });
+    return wrap;
+}
+
+/* ===== 14-internal-order-check.js ===== */
+
+// ─── Проверка товаров в заказах и внутренних заказах ─────────────────────────
+// Сравнивает агрегированные позиции заказов покупателей и внутренних заказов.
+const INTERNAL_ORDER_CHECK_STORAGE_KEY = 'hackerInternalOrderCheck_v1';
+const INTERNAL_ORDER_CHECK_DEFAULT_STATUS = 'Новый';
+const INTERNAL_ORDER_CHECK_ENTITIES = {
+    customerorder: {
+        label: 'Заказы покупателей',
+        organizationKey: 'customerOrganizationHref',
+        statusKey: 'customerStatusHrefs'
+    },
+    internalorder: {
+        label: 'Внутренние заказы',
+        organizationKey: 'internalOrganizationHref',
+        statusKey: 'internalStatusHrefs'
+    }
+};
+let internalOrderCheckSettings = {
+    customerOrganizationHref: '',
+    internalOrganizationHref: '',
+    customerWarehouseHref: '',
+    internalWarehouseHref: '',
+    customerStatusHrefs: [],
+    internalStatusHrefs: []
+};
+let internalOrderCheckStatuses = {
+    customerorder: [],
+    internalorder: []
+};
+let internalOrderCheckWarehouses = [];
+
+function internalOrderCheckNormalizeSettings(raw) {
+    const list = value => Array.isArray(value)
+        ? [...new Set(value.filter(item => typeof item === 'string' && item))]
+        : [];
+    return {
+        customerOrganizationHref: typeof raw?.customerOrganizationHref === 'string' ? raw.customerOrganizationHref : '',
+        internalOrganizationHref: typeof raw?.internalOrganizationHref === 'string' ? raw.internalOrganizationHref : '',
+        customerWarehouseHref: typeof raw?.customerWarehouseHref === 'string' ? raw.customerWarehouseHref : '',
+        internalWarehouseHref: typeof raw?.internalWarehouseHref === 'string' ? raw.internalWarehouseHref : '',
+        customerStatusHrefs: list(raw?.customerStatusHrefs),
+        internalStatusHrefs: list(raw?.internalStatusHrefs)
+    };
+}
+
+function internalOrderCheckLoadSettings() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(storageKey(INTERNAL_ORDER_CHECK_STORAGE_KEY)) || '{}');
+        internalOrderCheckSettings = internalOrderCheckNormalizeSettings(raw);
+        const warehouses = JSON.parse(localStorage.getItem(storageKey('hackerInternalOrderWarehouses_v1')) || '[]');
+        internalOrderCheckWarehouses = Array.isArray(warehouses)
+            ? warehouses.filter(item => item && typeof item.name === 'string' && typeof item.href === 'string')
+            : [];
+    } catch (error) {
+        internalOrderCheckSettings = internalOrderCheckNormalizeSettings({});
+        internalOrderCheckTrace('Не удалось загрузить настройки сравнения', error, 'err');
+    }
+}
+
+function internalOrderCheckSaveSettings() {
+    try {
+        localStorage.setItem(storageKey(INTERNAL_ORDER_CHECK_STORAGE_KEY), JSON.stringify(internalOrderCheckSettings));
+    } catch (error) {
+        internalOrderCheckTrace('Не удалось сохранить настройки сравнения', error, 'err');
+    }
+}
+
+function internalOrderCheckSaveWarehouses() {
+    try {
+        localStorage.setItem(storageKey('hackerInternalOrderWarehouses_v1'), JSON.stringify(internalOrderCheckWarehouses));
+    } catch (error) {
+        internalOrderCheckTrace('Не удалось сохранить список складов', error, 'err');
+    }
+}
+
+function internalOrderCheckTrace(message, details = null, kind = 'info') {
+    const prefix = '[Memchat:internal-orders]';
+    if (kind === 'err') console.error(prefix, message, details || '');
+    else if (kind === 'warn') console.warn(prefix, message, details || '');
+    else console.info(prefix, message, details || '');
+    if (typeof hackerLog === 'function') hackerLog(`📦 ${message}`, kind === 'err' ? 'err' : kind);
+}
+
+function internalOrderCheckStatusesFromMetadata(data) {
+    const states = Array.isArray(data?.states) ? data.states : (Array.isArray(data?.states?.rows) ? data.states.rows : []);
+    return states.map(state => ({
+        name: state.name,
+        href: state.meta?.href
+    })).filter(state => state.name && state.href);
+}
+
+function internalOrderCheckFillOrganizations() {
+    [
+        ['hackerInternalCustomerOrganization', 'customerOrganizationHref'],
+        ['hackerInternalOrderOrganization', 'internalOrganizationHref']
+    ].forEach(([id, key]) => {
+        const select = document.getElementById(id);
+        if (!select) return;
+        const selected = internalOrderCheckSettings[key];
+        const organizations = Array.isArray(hackerNotifierOrganizations) ? hackerNotifierOrganizations : [];
+        select.innerHTML = '';
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = organizations.length
+            ? '— выберите организацию —'
+            : '— нажмите «Загрузить справочники» —';
+        select.appendChild(empty);
+        organizations.forEach(item => {
+            const option = document.createElement('option');
+            option.value = item.href;
+            option.textContent = item.name;
+            option.selected = item.href === selected;
+            select.appendChild(option);
+        });
+        select.value = selected;
+    });
+}
+
+function internalOrderCheckFillWarehouses() {
+    [
+        ['hackerInternalCustomerWarehouse', 'customerWarehouseHref'],
+        ['hackerInternalOrderWarehouse', 'internalWarehouseHref']
+    ].forEach(([id, key]) => {
+        const select = document.getElementById(id);
+        if (!select) return;
+        const selected = internalOrderCheckSettings[key];
+        const warehouses = Array.isArray(internalOrderCheckWarehouses) ? internalOrderCheckWarehouses : [];
+        select.innerHTML = '';
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = warehouses.length
+            ? '— выберите склад —'
+            : '— нажмите «Загрузить справочники» —';
+        select.appendChild(empty);
+        warehouses.forEach(item => {
+            const option = document.createElement('option');
+            option.value = item.href;
+            option.textContent = item.name;
+            option.selected = item.href === selected;
+            select.appendChild(option);
+        });
+        select.value = selected;
+    });
+}
+
+function internalOrderCheckFillStatuses(entity) {
+    const config = INTERNAL_ORDER_CHECK_ENTITIES[entity];
+    const select = document.getElementById(entity === 'customerorder'
+        ? 'hackerInternalCustomerStatuses'
+        : 'hackerInternalOrderStatuses');
+    if (!config || !select) return;
+    const selected = internalOrderCheckSettings[config.statusKey];
+    select.innerHTML = '';
+    internalOrderCheckStatuses[entity].forEach(item => {
+        const option = document.createElement('option');
+        option.value = item.href;
+        option.textContent = item.name;
+        option.selected = selected.includes(item.href);
+        select.appendChild(option);
+    });
+    if (!internalOrderCheckStatuses[entity].length) {
+        const hint = document.createElement('option');
+        hint.disabled = true;
+        hint.textContent = '— нажмите «Загрузить справочники» —';
+        select.appendChild(hint);
+    }
+    if (!selected.length) {
+        const defaultState = internalOrderCheckStatuses[entity].find(item =>
+            String(item.name).trim().toLowerCase() === INTERNAL_ORDER_CHECK_DEFAULT_STATUS.toLowerCase());
+        if (defaultState) {
+            const option = [...select.options].find(item => item.value === defaultState.href);
+            if (option) option.selected = true;
+            internalOrderCheckSettings[config.statusKey] = [defaultState.href];
+            internalOrderCheckSaveSettings();
+        }
+    }
+}
+
+function internalOrderCheckReadControls() {
+    const customerOrganization = document.getElementById('hackerInternalCustomerOrganization');
+    const internalOrganization = document.getElementById('hackerInternalOrderOrganization');
+    const customerWarehouse = document.getElementById('hackerInternalCustomerWarehouse');
+    const internalWarehouse = document.getElementById('hackerInternalOrderWarehouse');
+    const customerStatuses = document.getElementById('hackerInternalCustomerStatuses');
+    const internalStatuses = document.getElementById('hackerInternalOrderStatuses');
+    internalOrderCheckSettings = internalOrderCheckNormalizeSettings({
+        customerOrganizationHref: customerOrganization?.value || '',
+        internalOrganizationHref: internalOrganization?.value || '',
+        customerWarehouseHref: customerWarehouse?.value || '',
+        internalWarehouseHref: internalWarehouse?.value || '',
+        customerStatusHrefs: customerStatuses
+            ? [...customerStatuses.selectedOptions].map(option => option.value)
+            : internalOrderCheckSettings.customerStatusHrefs,
+        internalStatusHrefs: internalStatuses
+            ? [...internalStatuses.selectedOptions].map(option => option.value)
+            : internalOrderCheckSettings.internalStatusHrefs
+    });
+    internalOrderCheckSaveSettings();
+}
+
+function internalOrderCheckRefreshStatuses(entity) {
+    const path = `/entity/${entity}/metadata`;
+    return msApiP('GET', path)
+        .then(data => {
+            internalOrderCheckStatuses[entity] = internalOrderCheckStatusesFromMetadata(data);
+            internalOrderCheckFillStatuses(entity);
+            internalOrderCheckTrace(`${INTERNAL_ORDER_CHECK_ENTITIES[entity].label}: статусы обновлены — ${internalOrderCheckStatuses[entity].length}`);
+            return internalOrderCheckStatuses[entity];
+        })
+        .catch(error => {
+            internalOrderCheckTrace(`${INTERNAL_ORDER_CHECK_ENTITIES[entity].label}: не удалось загрузить статусы`, error, 'err');
+            return internalOrderCheckStatuses[entity];
+        });
+}
+
+function internalOrderCheckRefreshOrganizations() {
+    return hackerNotifierRefreshOrganizations(true)
+        .then(items => {
+            internalOrderCheckFillOrganizations();
+            internalOrderCheckTrace(`Организации обновлены для двух типов документов: ${items.length} шт.`);
+            return items;
+        });
+}
+
+function internalOrderCheckRefreshWarehouses() {
+    return msApiP('GET', '/entity/store?order=name&limit=1000')
+        .then(data => {
+            internalOrderCheckWarehouses = (Array.isArray(data?.rows) ? data.rows : [])
+                .map(item => ({ name: item.name, href: item.meta?.href }))
+                .filter(item => item.name && item.href);
+            internalOrderCheckSaveWarehouses();
+            internalOrderCheckFillWarehouses();
+            internalOrderCheckTrace(`Склады обновлены: ${internalOrderCheckWarehouses.length} шт.`);
+            return internalOrderCheckWarehouses;
+        })
+        .catch(error => {
+            internalOrderCheckTrace('Не удалось загрузить склады', error, 'err');
+            return internalOrderCheckWarehouses;
+        });
+}
+
+function internalOrderCheckRefreshAllLists(status) {
+    if (!hackerBearerEnabled || !hackerBearerToken.trim()) {
+        const message = 'Для загрузки организаций, складов и статусов включите Bearer и укажите API-ключ МойСклад.';
+        if (status) {
+            status.textContent = message;
+            status.style.color = '#b45309';
+        }
+        internalOrderCheckTrace(message, null, 'warn');
+        return Promise.resolve([]);
+    }
+    return Promise.all([
+        internalOrderCheckRefreshOrganizations(),
+        internalOrderCheckRefreshWarehouses(),
+        internalOrderCheckRefreshStatuses('customerorder'),
+        internalOrderCheckRefreshStatuses('internalorder')
+    ]);
+}
+
+function internalOrderCheckStateNames(entity, statusHrefs) {
+    return statusHrefs
+        .map(href => internalOrderCheckStatuses[entity].find(state => state.href === href)?.name)
+        .filter(Boolean);
+}
+
+function internalOrderCheckMatchesStatus(row, statusHrefs, statusNames) {
+    const stateHref = row?.state?.meta?.href || '';
+    const stateName = String(row?.state?.name || '').trim().toLowerCase();
+    return statusHrefs.includes(stateHref) || statusNames.some(name => String(name).trim().toLowerCase() === stateName);
+}
+
+function internalOrderCheckMatchesWarehouse(entity, row, warehouseHref) {
+    const references = entity === 'customerorder'
+        ? [row?.store, row?.warehouse]
+        : [row?.sourceStore, row?.targetStore, row?.store];
+    return references.some(reference => reference?.meta?.href === warehouseHref);
+}
+
+function internalOrderCheckFetchDocuments(entity, organizationHref, warehouseHref, statusHrefs) {
+    if (!organizationHref) return Promise.reject(new Error(`Не выбрана организация: ${INTERNAL_ORDER_CHECK_ENTITIES[entity].label}`));
+    if (!warehouseHref) return Promise.reject(new Error(`Не выбран склад: ${INTERNAL_ORDER_CHECK_ENTITIES[entity].label}`));
+    if (!statusHrefs.length) return Promise.reject(new Error(`Не выбраны статусы: ${INTERNAL_ORDER_CHECK_ENTITIES[entity].label}`));
+    const filter = encodeURIComponent('organization=' + organizationHref);
+    const path = `/entity/${entity}?filter=${filter}&expand=state,store,sourceStore,targetStore&order=moment,desc&limit=1000`;
+    const statusNames = internalOrderCheckStateNames(entity, statusHrefs);
+    internalOrderCheckTrace(`Получаю ${INTERNAL_ORDER_CHECK_ENTITIES[entity].label}`, {
+        organizationHref,
+        warehouseHref,
+        statusHrefs,
+        statusNames,
+        path
+    });
+    return msApiP('GET', path).then(data => {
+        const rows = Array.isArray(data?.rows) ? data.rows : [];
+        const matching = rows.filter(row =>
+            internalOrderCheckMatchesStatus(row, statusHrefs, statusNames)
+            && internalOrderCheckMatchesWarehouse(entity, row, warehouseHref));
+        internalOrderCheckTrace(`${INTERNAL_ORDER_CHECK_ENTITIES[entity].label}: найдено документов — ${matching.length}`, {
+            totalRows: rows.length,
+            matchingNames: matching.map(row => row.name || row.id)
+        });
+        return matching;
+    });
+}
+
+function internalOrderCheckPositionRows(entity, document) {
+    if (Array.isArray(document?.positions?.rows)) return Promise.resolve(document.positions.rows);
+    const id = document?.id || document?.meta?.href?.split('/').pop();
+    if (!id) return Promise.resolve([]);
+    return msApiP('GET', `/entity/${entity}/${id}/positions?expand=assortment&limit=1000`)
+        .then(data => Array.isArray(data?.rows) ? data.rows : []);
+}
+
+function internalOrderCheckPositionKey(position) {
+    const assortment = position?.assortment || position?.product || {};
+    return assortment.meta?.href || assortment.id || `name:${String(assortment.name || position?.name || 'Без названия').trim().toLowerCase()}`;
+}
+
+function internalOrderCheckPositionName(position) {
+    const assortment = position?.assortment || position?.product || {};
+    return assortment.name || position?.name || 'Без названия';
+}
+
+function internalOrderCheckAggregate(rows) {
+    const result = {};
+    rows.forEach(position => {
+        const key = internalOrderCheckPositionKey(position);
+        const quantity = Number(position?.quantity);
+        const safeQuantity = Number.isFinite(quantity) ? quantity : 0;
+        if (!result[key]) result[key] = { key, name: internalOrderCheckPositionName(position), quantity: 0 };
+        result[key].quantity += safeQuantity;
+    });
+    return result;
+}
+
+function internalOrderCheckCompareMaps(customerGoods, internalGoods) {
+    const keys = new Set([...Object.keys(customerGoods), ...Object.keys(internalGoods)]);
+    const added = [];
+    const missed = [];
+    keys.forEach(key => {
+        const customer = customerGoods[key] || { key, name: internalGoods[key]?.name || key, quantity: 0 };
+        const internal = internalGoods[key] || { key, name: customer.name, quantity: 0 };
+        const difference = internal.quantity - customer.quantity;
+        if (difference > 0) added.push({ key, name: internal.name, quantity: difference, internalQuantity: internal.quantity, customerQuantity: customer.quantity });
+        if (difference < 0) missed.push({ key, name: customer.name, quantity: Math.abs(difference), internalQuantity: internal.quantity, customerQuantity: customer.quantity });
+    });
+    return {
+        added: added.sort((a, b) => a.name.localeCompare(b.name, 'ru')),
+        missed: missed.sort((a, b) => a.name.localeCompare(b.name, 'ru'))
+    };
+}
+
+function internalOrderCheckFormatGoods(items) {
+    return items.length
+        ? items.map(item => `${item.name} × ${item.quantity}`).join('; ')
+        : 'нет';
+}
+
+async function internalOrderCheckCollectGoods(entity, documents) {
+    const goods = [];
+    for (const document of documents) {
+        try {
+            const positions = await internalOrderCheckPositionRows(entity, document);
+            goods.push(...positions);
+            internalOrderCheckTrace(`${document.name || document.id}: получено позиций — ${positions.length}`);
+        } catch (error) {
+            internalOrderCheckTrace(`${document.name || document.id}: не удалось получить позиции`, error, 'err');
+        }
+    }
+    return internalOrderCheckAggregate(goods);
+}
+
+async function internalOrderCheckCompare() {
+    internalOrderCheckReadControls();
+    const status = document.getElementById('hackerInternalOrderCheckStatus');
+    const setStatus = (message, kind = 'info') => {
+        if (status) {
+            status.textContent = message;
+            status.style.color = kind === 'err' ? '#b91c1c' : kind === 'warn' ? '#b45309' : '#166534';
+        }
+    };
+    const compare = document.getElementById('hackerInternalOrderCompare');
+    if (compare) compare.disabled = true;
+    setStatus('Проверяю документы и позиции…');
+    try {
+        const [customerOrders, internalOrders] = await Promise.all([
+            internalOrderCheckFetchDocuments('customerorder', internalOrderCheckSettings.customerOrganizationHref, internalOrderCheckSettings.customerWarehouseHref, internalOrderCheckSettings.customerStatusHrefs),
+            internalOrderCheckFetchDocuments('internalorder', internalOrderCheckSettings.internalOrganizationHref, internalOrderCheckSettings.internalWarehouseHref, internalOrderCheckSettings.internalStatusHrefs)
+        ]);
+        const [customerGoods, internalGoods] = await Promise.all([
+            internalOrderCheckCollectGoods('customerorder', customerOrders),
+            internalOrderCheckCollectGoods('internalorder', internalOrders)
+        ]);
+        const result = internalOrderCheckCompareMaps(customerGoods, internalGoods);
+        const customerTotal = Object.values(customerGoods).reduce((sum, item) => sum + item.quantity, 0);
+        const internalTotal = Object.values(internalGoods).reduce((sum, item) => sum + item.quantity, 0);
+        internalOrderCheckTrace('Сравнение завершено', {
+            customerOrders: customerOrders.length,
+            internalOrders: internalOrders.length,
+            customerPositions: customerTotal,
+            internalPositions: internalTotal,
+            added: result.added,
+            missed: result.missed
+        });
+        internalOrderCheckTrace(`➕ Добавлено во внутренних заказах: ${internalOrderCheckFormatGoods(result.added)}`, result.added.length ? result.added : null, result.added.length ? 'info' : 'warn');
+        internalOrderCheckTrace(`⚠️ Упущено во внутренних заказах: ${internalOrderCheckFormatGoods(result.missed)}`, result.missed.length ? result.missed : null, result.missed.length ? 'warn' : 'info');
+        if (!result.added.length && !result.missed.length) internalOrderCheckTrace('✅ Списки товаров совпадают', null, 'info');
+        setStatus(`Готово: добавлено ${result.added.length}, упущено ${result.missed.length}`);
+        return result;
+    } catch (error) {
+        internalOrderCheckTrace('Сравнение не выполнено', error, 'err');
+        setStatus(error.message || String(error), 'err');
+        return null;
+    } finally {
+        if (compare) compare.disabled = false;
+    }
+}
+
+function hackerBuildInternalOrderCheckTab() {
+    internalOrderCheckLoadSettings();
+    const wrap = hackerEl('div');
+    wrap.id = 'hackerTabInternalOrderCheck';
+    wrap.appendChild(hackerEl('div', 'font-size:11px;color:#64748b;line-height:1.4;margin-bottom:7px;',
+        'Сравнивает товары из заказов покупателей с товарами из внутренних заказов по выбранным организациям и статусам.'));
+
+    const field = (label, select) => {
+        const block = hackerEl('label', 'display:block;font-size:11px;color:#475569;margin-bottom:7px;', label);
+        block.appendChild(select);
+        return block;
+    };
+    const customerOrganization = hackerSelect('hackerInternalCustomerOrganization', '— организация заказов —');
+    const internalOrganization = hackerSelect('hackerInternalOrderOrganization', '— организация внутренних заказов —');
+    const customerWarehouse = hackerSelect('hackerInternalCustomerWarehouse', '— склад заказов —');
+    const internalWarehouse = hackerSelect('hackerInternalOrderWarehouse', '— склад внутренних заказов —');
+    const customerStatuses = document.createElement('select');
+    customerStatuses.id = 'hackerInternalCustomerStatuses';
+    customerStatuses.multiple = true;
+    customerStatuses.size = 4;
+    customerStatuses.style.cssText = 'display:block;width:100%;margin-top:3px;padding:4px 6px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;';
+    const internalStatuses = customerStatuses.cloneNode(false);
+    internalStatuses.id = 'hackerInternalOrderStatuses';
+
+    wrap.appendChild(field('Организация заказов:', customerOrganization));
+    wrap.appendChild(field('Организация внутренних заказов:', internalOrganization));
+    wrap.appendChild(field('Склад заказов:', customerWarehouse));
+    wrap.appendChild(field('Склад внутренних заказов:', internalWarehouse));
+    wrap.appendChild(field('Статусы заказов:', customerStatuses));
+    wrap.appendChild(field('Статусы внутренних заказов:', internalStatuses));
+
+    const buttons = hackerEl('div', 'display:flex;gap:4px;flex-wrap:wrap;');
+    const refresh = hackerBtn('hackerInternalOrderRefresh', '⬇ Загрузить справочники', HACKER_MINI_BTN_CSS);
+    const compare = hackerBtn('hackerInternalOrderCompare', '🔎 Проверить товары', HACKER_BTN_CSS + 'background:#4f46e5;');
+    buttons.append(refresh, compare);
+    wrap.appendChild(buttons);
+    const status = hackerEl('div', 'min-height:16px;margin-top:6px;font-size:10.5px;', '');
+    status.id = 'hackerInternalOrderCheckStatus';
+    wrap.appendChild(status);
+
+    internalOrderCheckFillOrganizations();
+    internalOrderCheckFillWarehouses();
+    internalOrderCheckFillStatuses('customerorder');
+    internalOrderCheckFillStatuses('internalorder');
+    customerOrganization.addEventListener('change', internalOrderCheckReadControls);
+    internalOrganization.addEventListener('change', internalOrderCheckReadControls);
+    customerWarehouse.addEventListener('change', internalOrderCheckReadControls);
+    internalWarehouse.addEventListener('change', internalOrderCheckReadControls);
+    customerStatuses.addEventListener('change', internalOrderCheckReadControls);
+    internalStatuses.addEventListener('change', internalOrderCheckReadControls);
+    refresh.addEventListener('click', () => {
+        internalOrderCheckRefreshAllLists(status)
+            .catch(error => internalOrderCheckTrace('Не удалось обновить списки', error, 'err'));
+    });
+    compare.addEventListener('click', () => { internalOrderCheckCompare().catch(error => internalOrderCheckTrace('Сравнение: ' + error.message, error, 'err')); });
+    internalOrderCheckRefreshAllLists(status)
+        .catch(error => internalOrderCheckTrace('Не удалось загрузить списки для сравнения', error, 'err'));
+    return wrap;
 }
 
 // ─── Production entrypoint ───────────────────────────────────────────────────
