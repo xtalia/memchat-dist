@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Panel Enhancer — пресеты checkout
 // @namespace    https://github.com/xtalia/hatiko
-// @version      1.0.0-alpha
+// @version      1.1.0-alpha
 // @description  Пользовательские пресеты и компактный интерфейс для checkout Panel Hatiko
 // @match        https://panel.hatiko.ru/order/checkout*
 // @run-at       document-idle
@@ -14,6 +14,8 @@
     'use strict';
 
     const STORAGE_KEY = 'panel-enhancer:presets_v1';
+    const CONFIG_FORMAT = 'panel-enhancer-config';
+    const CONFIG_VERSION = 1;
     const CARD_SELECTOR = 'body > main > div.container > div:nth-child(3) > div.card-body';
     const BAR_ID = 'panelEnhancerPresetBar';
     const DIALOG_ID = 'panelEnhancerPresetDialog';
@@ -30,12 +32,10 @@
         return location.hostname === 'panel.hatiko.ru' && location.pathname === '/order/checkout';
     }
 
-    function loadPresets() {
-        try {
-            const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-            if (!Array.isArray(raw)) return [];
-            const seen = new Set();
-            return raw.map(item => ({
+    function normalizePresets(raw) {
+        if (!Array.isArray(raw)) return [];
+        const seen = new Set();
+        return raw.map(item => ({
                 id: typeof item?.id === 'string' && item.id ? item.id : `preset-${Date.now()}-${Math.random().toString(36).slice(2)}`,
                 name: typeof item?.name === 'string' ? item.name.trim().slice(0, 80) : '',
                 source: typeof item?.source === 'string' ? item.source : '',
@@ -47,6 +47,12 @@
                 seen.add(item.id);
                 return true;
             });
+    }
+
+    function loadPresets() {
+        try {
+            const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+            return normalizePresets(raw);
         } catch {
             return [];
         }
@@ -54,11 +60,34 @@
 
     function savePresets(presets) {
         try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(presets));
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizePresets(presets)));
             return true;
         } catch {
             return false;
         }
+    }
+
+    function exportConfig() {
+        return JSON.stringify({
+            format: CONFIG_FORMAT,
+            version: CONFIG_VERSION,
+            presets: loadPresets()
+        }, null, 2);
+    }
+
+    function importConfig(text) {
+        let parsed;
+        try {
+            parsed = JSON.parse(text);
+        } catch {
+            return { ok: false, error: 'Некорректный JSON' };
+        }
+        const rawPresets = Array.isArray(parsed) ? parsed : parsed?.presets;
+        if (!Array.isArray(rawPresets)) return { ok: false, error: 'В JSON нет массива presets' };
+        const presets = normalizePresets(rawPresets);
+        if (presets.length !== rawPresets.length) return { ok: false, error: 'В JSON есть некорректные пресеты' };
+        if (!savePresets(presets)) return { ok: false, error: 'Не удалось сохранить конфигурацию' };
+        return { ok: true, count: presets.length };
     }
 
     function field(name) {
@@ -205,6 +234,29 @@
         const status = document.createElement('div');
         status.style.cssText = 'min-height:17px;margin-bottom:7px;color:#64748b;font-size:11px;';
         const list = document.createElement('div');
+        const configArea = document.createElement('textarea');
+        configArea.rows = 8;
+        configArea.placeholder = 'Здесь появится JSON конфигурации. Его можно скопировать или вставить для импорта.';
+        configArea.style.cssText = 'display:block;width:100%;box-sizing:border-box;margin-top:12px;padding:7px 8px;border:1px solid #cbd5e1;border-radius:6px;font:11px/1.35 Consolas,monospace;resize:vertical;';
+        const configActions = document.createElement('div');
+        configActions.style.cssText = 'display:flex;gap:6px;margin-top:6px;';
+        const exportButton = button('📤 Экспорт JSON', 'Показать текущую конфигурацию в JSON', () => {
+            configArea.value = exportConfig();
+            configArea.focus();
+            configArea.select();
+            status.textContent = '✅ Конфигурация подготовлена. Скопируйте JSON из поля ниже.';
+        });
+        const importButton = button('📥 Импорт JSON', 'Загрузить конфигурацию из JSON', () => {
+            const result = importConfig(configArea.value);
+            if (!result.ok) {
+                status.textContent = `❌ ${result.error}`;
+                return;
+            }
+            renderDialogList(list, status);
+            renderBar();
+            status.textContent = `✅ Импортировано пресетов: ${result.count}`;
+        });
+        configActions.append(exportButton, importButton);
         const save = button('Сохранить текущие', 'Сохранить текущие значения полей', () => {
             const values = currentValues();
             const name = input.value.trim();
@@ -219,7 +271,7 @@
             status.textContent = `✅ Сохранён «${name}»`;
         });
         form.append(input, save);
-        box.append(header, form, status, list);
+        box.append(header, form, status, list, configArea, configActions);
         overlay.appendChild(box);
         document.body.appendChild(overlay);
         overlay.addEventListener('click', event => { if (event.target === overlay) overlay.remove(); });
