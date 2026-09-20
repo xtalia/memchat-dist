@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.5.0-alpha
+// @version      8.6.0-alpha
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.5.0-alpha';
+const MEMCHAT_VERSION = '8.6.0-alpha';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -126,6 +126,7 @@ let hackerNotifierSettings = {
     enabled: true,
     soundEnabled: true,
     intervalMinutes: HACKER_NOTIFIER_DEFAULT_INTERVAL_MINUTES,
+    toastDurationMinutes: 5,
     organizationHref: '',
     statusHrefs: []
 };
@@ -3357,7 +3358,7 @@ function initialize() {
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v8.5.0-alpha инициализирован');
+    console.log('Мемный чат v8.6.0-alpha инициализирован');
 
     // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
     if (/online\.moysklad\.ru$/.test(location.hostname)) {
@@ -4957,12 +4958,16 @@ function startMsSpaObserver() {
 
 function hackerNotifierNormalizeSettings(raw) {
     const interval = Number(raw?.intervalMinutes);
+    const toastDuration = Number(raw?.toastDurationMinutes);
     return {
         enabled: raw?.enabled !== false,
         soundEnabled: raw?.soundEnabled !== false,
         intervalMinutes: Number.isFinite(interval)
             ? Math.min(1440, Math.max(1, Math.round(interval)))
             : HACKER_NOTIFIER_DEFAULT_INTERVAL_MINUTES,
+        toastDurationMinutes: Number.isFinite(toastDuration)
+            ? Math.min(1440, Math.max(0, Math.round(toastDuration)))
+            : 5,
         organizationHref: typeof raw?.organizationHref === 'string' ? raw.organizationHref : '',
         statusHrefs: Array.isArray(raw?.statusHrefs)
             ? [...new Set(raw.statusHrefs.filter(value => typeof value === 'string' && value))]
@@ -5056,6 +5061,8 @@ function hackerNotifierFillControls() {
     if (soundEnabled) soundEnabled.checked = hackerNotifierSettings.soundEnabled;
     const interval = document.getElementById('hackerNotifierInterval');
     if (interval) interval.value = String(hackerNotifierSettings.intervalMinutes);
+    const toastDuration = document.getElementById('hackerNotifierToastDuration');
+    if (toastDuration) toastDuration.value = String(hackerNotifierSettings.toastDurationMinutes);
 }
 
 function hackerNotifierSelectDefaultStatus() {
@@ -5140,7 +5147,7 @@ function hackerNotifierShowToast(order) {
 
     const toast = document.createElement('div');
     toast.className = 'hacker-notifier-toast';
-    const lifetime = hackerNotifierSettings.soundEnabled ? 5000 : 30000;
+    const lifetime = hackerNotifierSettings.toastDurationMinutes * 60 * 1000;
     toast.dataset.dismissMs = String(lifetime);
     toast.style.cssText = 'box-sizing:border-box;width:100%;padding:11px 13px 12px;'
         + 'background:linear-gradient(145deg,#111827,#1f2937);'
@@ -5196,7 +5203,7 @@ function hackerNotifierShowToast(order) {
         }, 220);
     };
     const scheduleDismiss = () => {
-        if (closed || paused) return;
+        if (closed || paused || !lifetime) return;
         timerStartedAt = Date.now();
         dismissTimer = window.setTimeout(fadeToast, remaining);
     };
@@ -5213,11 +5220,11 @@ function hackerNotifierShowToast(order) {
         toast.dataset.timerPaused = 'false';
         scheduleDismiss();
     });
-    if (!hackerNotifierSettings.soundEnabled) {
+    {
         const close = document.createElement('button');
         close.type = 'button';
         close.textContent = '✕';
-        close.title = 'Закрыть уведомление';
+        close.title = 'Удалить уведомление';
         close.style.cssText = 'position:absolute;top:5px;right:7px;padding:0;border:0;'
             + 'background:transparent;color:#fecaca;font-size:15px;line-height:1;cursor:pointer;';
         close.addEventListener('click', removeToast);
@@ -5226,7 +5233,7 @@ function hackerNotifierShowToast(order) {
 
         const closeButton = document.createElement('button');
         closeButton.type = 'button';
-        closeButton.textContent = 'Закрыть';
+        closeButton.textContent = 'Удалить';
         closeButton.style.cssText = 'margin-top:8px;padding:3px 8px;border:1px solid #64748b;'
             + 'border-radius:5px;background:#334155;color:#f8fafc;font-size:10px;cursor:pointer;';
         closeButton.addEventListener('click', removeToast);
@@ -5385,12 +5392,14 @@ function hackerNotifierReadControls() {
     const organization = document.getElementById('hackerNotifierOrganization');
     const statuses = document.getElementById('hackerNotifierStatuses');
     const interval = document.getElementById('hackerNotifierInterval');
+    const toastDuration = document.getElementById('hackerNotifierToastDuration');
     hackerNotifierSettings = hackerNotifierNormalizeSettings({
         enabled: enabled?.checked,
         soundEnabled: soundEnabled ? soundEnabled.checked : hackerNotifierSettings.soundEnabled,
         organizationHref: organization?.value || '',
         statusHrefs: statuses ? [...statuses.selectedOptions].map(option => option.value) : hackerNotifierSettings.statusHrefs,
-        intervalMinutes: interval?.value
+        intervalMinutes: interval?.value,
+        toastDurationMinutes: toastDuration?.value
     });
     hackerNotifierStatusSelectionInitialized = true;
     hackerNotifierSaveSettings();
@@ -5451,6 +5460,18 @@ function hackerBuildNotifierTab() {
     intervalLabel.appendChild(interval);
     wrap.appendChild(intervalLabel);
 
+    const toastDurationLabel = hackerEl('label', 'display:flex;align-items:center;gap:5px;font-size:11.5px;color:#475569;margin:5px 0 7px;', 'Показывать уведомление, минут:');
+    const toastDuration = document.createElement('input');
+    toastDuration.id = 'hackerNotifierToastDuration';
+    toastDuration.type = 'number';
+    toastDuration.min = '0';
+    toastDuration.max = '1440';
+    toastDuration.step = '1';
+    toastDuration.title = '0 — показывать до нажатия «Удалить»';
+    toastDuration.style.cssText = 'width:70px;padding:4px 6px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;';
+    toastDurationLabel.appendChild(toastDuration);
+    wrap.appendChild(toastDurationLabel);
+
     const buttons = hackerEl('div', 'display:flex;gap:4px;flex-wrap:wrap;');
     const save = hackerBtn('hackerNotifierSave', '💾 Сохранить и запустить', HACKER_BTN_CSS + 'background:#4f46e5;');
     const poll = hackerBtn('hackerNotifierPollNow', '⟳ Проверить сейчас', HACKER_MINI_BTN_CSS);
@@ -5468,6 +5489,8 @@ function hackerBuildNotifierTab() {
     statuses.addEventListener('change', hackerNotifierReadControls);
     interval.addEventListener('input', hackerNotifierReadControls);
     interval.addEventListener('change', hackerNotifierReadControls);
+    toastDuration.addEventListener('input', hackerNotifierReadControls);
+    toastDuration.addEventListener('change', hackerNotifierReadControls);
     save.addEventListener('click', () => { hackerNotifierReadControls(); hackerNotifierPoll(); });
     poll.addEventListener('click', () => { hackerNotifierReadControls(); hackerNotifierPoll(); });
     sound.addEventListener('click', hackerNotifierPlayAlarm);
