@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.4.0-alpha
+// @version      8.4.1-alpha
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.4.0-alpha';
+const MEMCHAT_VERSION = '8.4.1-alpha';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -476,9 +476,11 @@ function startPanelBridgeListener() {
 }
 
 function requestPanelCsrfViaBridge(onSuccess, onError) {
-    panelBridgeOrigins().forEach(origin => {
-        try { window.postMessage({ source: 'memchat-main', type: 'panel-token-request' }, origin); } catch (e) { /* ignore */ }
-    });
+    const allowedOrigins = [...panelBridgeOrigins(), 'https://panel.hatiko.ru'];
+    const targetOrigin = allowedOrigins.includes(window.location.origin) ? window.location.origin : '';
+    if (targetOrigin) {
+        try { window.postMessage({ source: 'memchat-main', type: 'panel-token-request' }, targetOrigin); } catch (e) { /* ignore */ }
+    }
     let answered = false;
     const handler = event => {
         const d = event.data;
@@ -3404,7 +3406,7 @@ function initialize() {
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v8.4.0-alpha инициализирован');
+    console.log('Мемный чат v8.4.1-alpha инициализирован');
 
     // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
     if (/online\.moysklad\.ru$/.test(location.hostname)) {
@@ -6294,10 +6296,14 @@ function panelCheckoutRenderPresetList(list, statusTarget) {
 function panelCheckoutRenderBar() {
     const bar = document.getElementById('mcPanelCheckoutPresets');
     if (!bar) return;
+    const presets = panelCheckoutLoadPresets();
+    const signature = JSON.stringify(presets);
+    if (bar.dataset.presetsSignature === signature) return;
+    bar.dataset.presetsSignature = signature;
     const buttons = bar.querySelector('[data-presets-list]');
     const status = bar.querySelector('[data-presets-status]');
     buttons.replaceChildren();
-    panelCheckoutLoadPresets().forEach(preset => {
+    presets.forEach(preset => {
         const button = panelCheckoutButton(preset.name, `Применить «${preset.name}»`, () => panelCheckoutApplyPreset(preset, status));
         buttons.appendChild(button);
     });
@@ -6308,6 +6314,11 @@ function panelCheckoutMountBar() {
     const card = document.querySelector(PANEL_CHECKOUT_CARD_SELECTOR);
     if (!card) return false;
     let bar = document.getElementById('mcPanelCheckoutPresets');
+    let shouldRender = false;
+    if (bar && bar.parentElement !== card) {
+        bar.remove();
+        bar = null;
+    }
     if (!bar) {
         bar = document.createElement('div');
         bar.id = 'mcPanelCheckoutPresets';
@@ -6325,8 +6336,9 @@ function panelCheckoutMountBar() {
         const create = panelCheckoutButton('➕', 'Создать пресет из текущих значений', panelCheckoutOpenPresetDialog);
         bar.append(label, list, settings, create, status);
         card.prepend(bar);
+        shouldRender = true;
     }
-    panelCheckoutRenderBar();
+    if (shouldRender) panelCheckoutRenderBar();
     return true;
 }
 
