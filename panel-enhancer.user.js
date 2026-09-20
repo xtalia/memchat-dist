@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Panel Enhancer — пресеты checkout
 // @namespace    https://github.com/xtalia/hatiko
-// @version      1.2.0-alpha
+// @version      1.3.0-alpha
 // @description  Пользовательские пресеты и компактный интерфейс для checkout Panel Hatiko
 // @match        https://panel.hatiko.ru/order/checkout*
 // @run-at       document-idle
@@ -105,9 +105,37 @@
         return select?.options[select.selectedIndex]?.textContent.trim() || select?.value || '';
     }
 
+    function cityLabel() {
+        return selectedLabel('stock')
+            .replace(/^склад\s+/i, '')
+            .replace(/\s+склад$/i, '')
+            .trim();
+    }
+
+    function shortChannelLabel(label) {
+        const normalized = String(label || '').replace(/\s+/g, ' ').trim();
+        const aliases = [
+            [/интернет[- ]?магазин|сайт|онлайн/i, 'Сайт'],
+            [/маркетплейс/i, 'МП'],
+            [/розничн.*магазин|магазин/i, 'Магазин'],
+            [/телефон/i, 'Телефон'],
+            [/мессенджер|чат/i, 'Чат'],
+            [/рекомендац/i, 'Рек.'],
+            [/покупател|клиент/i, 'Вход'],
+            [/партн[её]р/i, 'Партн.']
+        ];
+        const alias = aliases.find(([pattern]) => pattern.test(normalized));
+        if (alias) return alias[1];
+        const compact = normalized.replace(/\b(канал|продаж|поступления|поступление|источник)\b/gi, '').replace(/\s+/g, ' ').trim();
+        if (compact.length <= 16) return compact || normalized;
+        const words = compact.split(' ').filter(Boolean);
+        return words.length > 1 ? words.map(word => word[0]).join('').toUpperCase() : compact.slice(0, 14);
+    }
+
     function autoPresetName(existing) {
-        const labels = Object.keys(FIELD_IDS).map(selectedLabel).filter(Boolean);
-        const base = (`Авто: ${labels.join(' / ')}` || 'Автопресет').slice(0, 80);
+        const labels = [cityLabel(), selectedLabel('priceType'), shortChannelLabel(selectedLabel('channel')), shortChannelLabel(selectedLabel('source'))]
+            .filter(Boolean);
+        const base = (`Авто: ${labels.join(' · ')}` || 'Автопресет').slice(0, 80);
         let index = 1;
         let candidate = base;
         while (existing.some(item => item.name === candidate)) {
