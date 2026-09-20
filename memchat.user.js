@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.2.9-beta
+// @version      8.3.0-beta
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.2.9-beta';
+const MEMCHAT_VERSION = '8.3.0-beta';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -2730,7 +2730,8 @@ function buildSettingsSnapshot() {
         retryBehavior,
         msQuickPanelEnabled,
         msMagicConfig,
-        hackerOrderNotifier: hackerNotifierSettings
+        hackerOrderNotifier: hackerNotifierSettings,
+        internalOrderCheck: internalOrderCheckSettings
     };
 }
 
@@ -2828,6 +2829,14 @@ function importSettings(jsonText) {
         hackerNotifierFillControls();
         hackerNotifierMaybeStart();
     }
+    if (data.internalOrderCheck && typeof data.internalOrderCheck === 'object') {
+        internalOrderCheckSettings = internalOrderCheckNormalizeSettings(data.internalOrderCheck);
+        internalOrderCheckSaveSettings();
+        internalOrderCheckFillOrganizations();
+        internalOrderCheckFillWarehouses();
+        internalOrderCheckFillStatuses('customerorder');
+        internalOrderCheckFillStatuses('internalorder');
+    }
 
     const area = document.getElementById('mcImportArea');
     const actions = document.getElementById('mcImportActions');
@@ -2845,7 +2854,7 @@ function renderHackerInlineTab() {
     const tabs = document.createElement('div');
     tabs.id = 'hackerTabs';
     tabs.style.cssText = 'display:flex;gap:4px;flex:0 0 auto;';
-    [['status', 'Статус'], ['agent', 'Контрагент'], ['sale', 'Автопродажа'], ['notifier', 'Новые заказы'], ['internalOrderCheck', 'Проверка товаров']].forEach(([key, label]) => {
+    [['status', 'Статус'], ['agent', 'Контрагент'], ['sale', 'Автопродажа'], ['notifier', 'Новые заказы'], ['internalOrderCheck', 'Проверка заказов']].forEach(([key, label]) => {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.textContent = label;
@@ -2910,7 +2919,7 @@ function openHackerWindow() {
         ['agent', 'Контрагент'],
         ['sale', 'Автопродажа'],
         ['notifier', 'Новые заказы'],
-        ['internalOrderCheck', 'Проверка товаров']
+        ['internalOrderCheck', 'Проверка заказов']
     ];
     HACKER_TABS.forEach(([key, label], i) => {
         const btn = document.createElement('button');
@@ -2984,7 +2993,7 @@ function hackerSelectTab(key) {
 
 // ─── Окно «Настройки» ─────────────────────────────────────────────────────────
 // Отдельное плавающее перетаскиваемое окно (позиция сохраняется).
-function openSettingsWindow() {
+function openSettingsWindow(initialTab = 'general') {
     closeMemchatOverlay();
 
     const win = document.createElement('div');
@@ -3095,10 +3104,52 @@ function openSettingsWindow() {
             <button id="mcImportCancel" class="mc-btn mc-btn-slate" style="flex:1;">Отмена</button>
         </div>
     `;
+
+    const generalPane = document.createElement('div');
+    generalPane.id = 'mcSettingsGeneralPane';
+    while (body.firstChild) generalPane.appendChild(body.firstChild);
+
+    const settingsTabs = document.createElement('div');
+    settingsTabs.id = 'mcSettingsTabs';
+    settingsTabs.style.cssText = 'display:flex;gap:4px;margin-bottom:9px;';
+    const settingsGeneralTab = document.createElement('button');
+    settingsGeneralTab.id = 'mcSettingsTabGeneral';
+    settingsGeneralTab.type = 'button';
+    settingsGeneralTab.textContent = '⚙️ Общие';
+    const settingsOrderTab = document.createElement('button');
+    settingsOrderTab.id = 'mcSettingsTabInternalOrderCheck';
+    settingsOrderTab.type = 'button';
+    settingsOrderTab.textContent = '📦 Проверка заказов';
+    [settingsGeneralTab, settingsOrderTab].forEach(button => {
+        button.style.cssText = 'flex:1;padding:6px 5px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#475569;font-size:11px;font-weight:600;cursor:pointer;';
+        settingsTabs.appendChild(button);
+    });
+
+    const orderCheckPane = document.createElement('div');
+    orderCheckPane.id = 'mcSettingsInternalOrderCheckPane';
+    orderCheckPane.style.display = 'none';
+    const ensureOrderCheckSettings = () => {
+        if (!orderCheckPane.firstChild) orderCheckPane.appendChild(internalOrderCheckBuildSettingsPanel());
+    };
+    const activateSettingsTab = key => {
+        const orderActive = key === 'internalOrderCheck';
+        if (orderActive) ensureOrderCheckSettings();
+        generalPane.style.display = orderActive ? 'none' : 'block';
+        orderCheckPane.style.display = orderActive ? 'block' : 'none';
+        settingsGeneralTab.style.background = orderActive ? '#f8fafc' : 'linear-gradient(135deg,#6366f1,#8b5cf6)';
+        settingsGeneralTab.style.color = orderActive ? '#475569' : '#fff';
+        settingsOrderTab.style.background = orderActive ? 'linear-gradient(135deg,#6366f1,#8b5cf6)' : '#f8fafc';
+        settingsOrderTab.style.color = orderActive ? '#fff' : '#475569';
+    };
+    settingsGeneralTab.addEventListener('click', () => activateSettingsTab('general'));
+    settingsOrderTab.addEventListener('click', () => activateSettingsTab('internalOrderCheck'));
+    body.append(settingsTabs, generalPane, orderCheckPane);
+
     win.appendChild(body);
 
     // Сначала в DOM — иначе getElementById не найдёт элементы окна.
     document.body.appendChild(win);
+    activateSettingsTab(initialTab === 'internalOrderCheck' ? 'internalOrderCheck' : 'general');
 
     // Привязки: setup-функции синхронизируют состояние, документ-слушатель вешается один раз.
     setupGlobalClearTextFunctionality();
@@ -5667,10 +5718,10 @@ function internalOrderCheckReadControls() {
     const customerStatuses = document.getElementById('hackerInternalCustomerStatuses');
     const internalStatuses = document.getElementById('hackerInternalOrderStatuses');
     internalOrderCheckSettings = internalOrderCheckNormalizeSettings({
-        customerOrganizationHref: customerOrganization?.value || '',
-        internalOrganizationHref: internalOrganization?.value || '',
-        customerWarehouseHref: customerWarehouse?.value || '',
-        internalWarehouseHref: internalWarehouse?.value || '',
+        customerOrganizationHref: customerOrganization ? customerOrganization.value : internalOrderCheckSettings.customerOrganizationHref,
+        internalOrganizationHref: internalOrganization ? internalOrganization.value : internalOrderCheckSettings.internalOrganizationHref,
+        customerWarehouseHref: customerWarehouse ? customerWarehouse.value : internalOrderCheckSettings.customerWarehouseHref,
+        internalWarehouseHref: internalWarehouse ? internalWarehouse.value : internalOrderCheckSettings.internalWarehouseHref,
         customerStatusHrefs: customerStatuses
             ? [...customerStatuses.selectedOptions].map(option => option.value)
             : internalOrderCheckSettings.customerStatusHrefs,
@@ -5839,6 +5890,65 @@ function internalOrderCheckFormatGoods(items) {
         : 'нет';
 }
 
+function internalOrderCheckShowResult(result) {
+    document.getElementById('hackerInternalOrderCheckResult')?.remove();
+    const win = document.createElement('div');
+    win.id = 'hackerInternalOrderCheckResult';
+    win.className = 'mc-float-window';
+    win.style.width = '430px';
+    win.style.right = '460px';
+
+    const header = document.createElement('div');
+    header.className = 'mc-float-header';
+    const title = document.createElement('div');
+    title.className = 'mc-float-title';
+    title.textContent = '📦 Результат проверки товаров';
+    header.appendChild(title);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'mc-float-close';
+    close.textContent = '✕';
+    close.addEventListener('click', () => win.remove());
+    header.appendChild(close);
+    win.appendChild(header);
+
+    const body = document.createElement('div');
+    body.className = 'mc-float-body';
+    const summary = document.createElement('div');
+    summary.style.cssText = 'font-size:11px;color:#64748b;margin-bottom:8px;';
+    summary.textContent = `Добавлено: ${result.added.length}; упущено: ${result.missed.length}`;
+    body.appendChild(summary);
+
+    const addSection = (titleText, items, color, emptyText) => {
+        const section = document.createElement('section');
+        section.style.cssText = 'margin-bottom:10px;';
+        const heading = document.createElement('div');
+        heading.style.cssText = `font-size:11.5px;font-weight:700;color:${color};margin-bottom:4px;`;
+        heading.textContent = titleText;
+        section.appendChild(heading);
+        if (!items.length) {
+            const empty = document.createElement('div');
+            empty.style.cssText = 'padding:7px 9px;border:1px solid #e5e7eb;border-radius:7px;color:#64748b;font-size:11px;';
+            empty.textContent = emptyText;
+            section.appendChild(empty);
+        } else {
+            items.forEach(item => {
+                const row = document.createElement('div');
+                row.style.cssText = 'padding:6px 9px;margin-top:4px;border:1px solid #e5e7eb;border-radius:7px;background:#fff;color:#1f2937;font-size:11.5px;';
+                row.textContent = `${item.name} × ${item.quantity}`;
+                section.appendChild(row);
+            });
+        }
+        body.appendChild(section);
+    };
+
+    addSection('➕ Добавлено во внутренних заказах', result.added, '#166534', 'Нет лишних позиций');
+    addSection('⚠️ Упущено во внутренних заказах', result.missed, '#b91c1c', 'Все позиции покрыты');
+    win.appendChild(body);
+    document.body.appendChild(win);
+    makeMovable(win, header);
+}
+
 async function internalOrderCheckCollectGoods(entity, documents) {
     const goods = [];
     for (const document of documents) {
@@ -5888,6 +5998,7 @@ async function internalOrderCheckCompare() {
         internalOrderCheckTrace(`➕ Добавлено во внутренних заказах: ${internalOrderCheckFormatGoods(result.added)}`, result.added.length ? result.added : null, result.added.length ? 'info' : 'warn');
         internalOrderCheckTrace(`⚠️ Упущено во внутренних заказах: ${internalOrderCheckFormatGoods(result.missed)}`, result.missed.length ? result.missed : null, result.missed.length ? 'warn' : 'info');
         if (!result.added.length && !result.missed.length) internalOrderCheckTrace('✅ Списки товаров совпадают', null, 'info');
+        internalOrderCheckShowResult(result);
         setStatus(`Готово: добавлено ${result.added.length}, упущено ${result.missed.length}`);
         return result;
     } catch (error) {
@@ -5899,27 +6010,30 @@ async function internalOrderCheckCompare() {
     }
 }
 
-function hackerBuildInternalOrderCheckTab() {
+function internalOrderCheckBuildSettingsPanel() {
     internalOrderCheckLoadSettings();
     const wrap = hackerEl('div');
-    wrap.id = 'hackerTabInternalOrderCheck';
-    wrap.appendChild(hackerEl('div', 'font-size:11px;color:#64748b;line-height:1.4;margin-bottom:7px;',
-        'Сравнивает товары из заказов покупателей с товарами из внутренних заказов по выбранным организациям и статусам.'));
+    wrap.id = 'hackerInternalOrderSettings';
+    wrap.appendChild(hackerEl('div', 'font-size:11px;color:#64748b;line-height:1.4;margin-bottom:8px;',
+        'Эти параметры используются вкладкой «Проверка заказов». Изменения сохраняются автоматически.'));
 
     const field = (label, select) => {
-        const block = hackerEl('label', 'display:block;font-size:11px;color:#475569;margin-bottom:7px;', label);
+        const block = hackerEl('label', 'display:block;font-size:11px;color:#475569;margin-bottom:8px;', label);
         block.appendChild(select);
         return block;
     };
+    const selectStyle = 'display:block;width:100%;margin-top:3px;padding:5px 6px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;';
     const customerOrganization = hackerSelect('hackerInternalCustomerOrganization', '— организация заказов —');
     const internalOrganization = hackerSelect('hackerInternalOrderOrganization', '— организация внутренних заказов —');
     const customerWarehouse = hackerSelect('hackerInternalCustomerWarehouse', '— склад заказов —');
     const internalWarehouse = hackerSelect('hackerInternalOrderWarehouse', '— склад внутренних заказов —');
+    [customerOrganization, internalOrganization, customerWarehouse, internalWarehouse].forEach(select => { select.style.cssText = selectStyle; });
+
     const customerStatuses = document.createElement('select');
     customerStatuses.id = 'hackerInternalCustomerStatuses';
     customerStatuses.multiple = true;
     customerStatuses.size = 4;
-    customerStatuses.style.cssText = 'display:block;width:100%;margin-top:3px;padding:4px 6px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;color:#334155;font-size:11px;';
+    customerStatuses.style.cssText = selectStyle + 'min-height:76px;';
     const internalStatuses = customerStatuses.cloneNode(false);
     internalStatuses.id = 'hackerInternalOrderStatuses';
 
@@ -5927,16 +6041,13 @@ function hackerBuildInternalOrderCheckTab() {
     wrap.appendChild(field('Организация внутренних заказов:', internalOrganization));
     wrap.appendChild(field('Склад заказов:', customerWarehouse));
     wrap.appendChild(field('Склад внутренних заказов:', internalWarehouse));
-    wrap.appendChild(field('Статусы заказов:', customerStatuses));
-    wrap.appendChild(field('Статусы внутренних заказов:', internalStatuses));
+    wrap.appendChild(field('Статусы заказов (Ctrl/⌘ — несколько):', customerStatuses));
+    wrap.appendChild(field('Статусы внутренних заказов (Ctrl/⌘ — несколько):', internalStatuses));
 
-    const buttons = hackerEl('div', 'display:flex;gap:4px;flex-wrap:wrap;');
     const refresh = hackerBtn('hackerInternalOrderRefresh', '⬇ Загрузить справочники', HACKER_MINI_BTN_CSS);
-    const compare = hackerBtn('hackerInternalOrderCompare', '🔎 Проверить товары', HACKER_BTN_CSS + 'background:#4f46e5;');
-    buttons.append(refresh, compare);
-    wrap.appendChild(buttons);
+    wrap.appendChild(refresh);
     const status = hackerEl('div', 'min-height:16px;margin-top:6px;font-size:10.5px;', '');
-    status.id = 'hackerInternalOrderCheckStatus';
+    status.id = 'hackerInternalOrderSettingsStatus';
     wrap.appendChild(status);
 
     internalOrderCheckFillOrganizations();
@@ -5953,9 +6064,29 @@ function hackerBuildInternalOrderCheckTab() {
         internalOrderCheckRefreshAllLists(status)
             .catch(error => internalOrderCheckTrace('Не удалось обновить списки', error, 'err'));
     });
-    compare.addEventListener('click', () => { internalOrderCheckCompare().catch(error => internalOrderCheckTrace('Сравнение: ' + error.message, error, 'err')); });
     internalOrderCheckRefreshAllLists(status)
         .catch(error => internalOrderCheckTrace('Не удалось загрузить списки для сравнения', error, 'err'));
+    return wrap;
+}
+
+function hackerBuildInternalOrderCheckTab() {
+    internalOrderCheckLoadSettings();
+    const wrap = hackerEl('div');
+    wrap.id = 'hackerTabInternalOrderCheck';
+    wrap.appendChild(hackerEl('div', 'font-size:11px;color:#64748b;line-height:1.4;margin-bottom:8px;',
+        'Сравнивает товары из заказов покупателей с товарами из внутренних заказов по сохранённым параметрам.'));
+
+    const buttons = hackerEl('div', 'display:flex;gap:4px;flex-wrap:wrap;');
+    const settings = hackerBtn('hackerInternalOrderOpenSettings', '⚙️ Настроить проверку', HACKER_MINI_BTN_CSS);
+    const compare = hackerBtn('hackerInternalOrderCompare', '🔎 Проверить товары', HACKER_BTN_CSS + 'background:#4f46e5;');
+    buttons.append(settings, compare);
+    wrap.appendChild(buttons);
+    const status = hackerEl('div', 'min-height:16px;margin-top:6px;font-size:10.5px;', '');
+    status.id = 'hackerInternalOrderCheckStatus';
+    wrap.appendChild(status);
+
+    settings.addEventListener('click', () => openSettingsWindow('internalOrderCheck'));
+    compare.addEventListener('click', () => { internalOrderCheckCompare().catch(error => internalOrderCheckTrace('Сравнение: ' + error.message, error, 'err')); });
     return wrap;
 }
 
