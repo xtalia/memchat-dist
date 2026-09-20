@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.3.0-beta
+// @version      8.4.0-alpha
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.3.0-beta';
+const MEMCHAT_VERSION = '8.4.0-alpha';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -3398,12 +3398,13 @@ function initialize() {
     } catch { /* defaults */ }
     startPanelBridgeListener();
     schedulePanelCsrfRefresh();
+    initPanelCheckoutPresets();
     GM_registerMenuCommand('Открыть мемный чат', createPriceCheckWindow);
         GM_registerMenuCommand('Закрыть мемный чат', closeChatWindow);
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v8.2.8-beta инициализирован');
+    console.log('Мемный чат v8.4.0-alpha инициализирован');
 
     // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
     if (/online\.moysklad\.ru$/.test(location.hostname)) {
@@ -6088,6 +6089,259 @@ function hackerBuildInternalOrderCheckTab() {
     settings.addEventListener('click', () => openSettingsWindow('internalOrderCheck'));
     compare.addEventListener('click', () => { internalOrderCheckCompare().catch(error => internalOrderCheckTrace('Сравнение: ' + error.message, error, 'err')); });
     return wrap;
+}
+
+/* ===== 15-panel-checkout-presets.js ===== */
+
+'use strict';
+
+// ─── Пользовательские пресеты checkout panel.hatiko.ru ───────────────────────
+const PANEL_CHECKOUT_PRESETS_KEY = 'panelCheckoutPresets_v1';
+const PANEL_CHECKOUT_CARD_SELECTOR = 'body > main > div.container > div:nth-child(3) > div.card-body';
+let panelCheckoutPresetObserver = null;
+
+function panelCheckoutPresetsEnabled() {
+    return location.hostname === 'panel.hatiko.ru' && location.pathname === '/order/checkout';
+}
+
+function panelCheckoutNormalizePresets(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw.map(item => ({
+        id: typeof item?.id === 'string' && item.id ? item.id : `preset-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        name: typeof item?.name === 'string' ? item.name.trim().slice(0, 80) : '',
+        source: typeof item?.source === 'string' ? item.source : '',
+        channel: typeof item?.channel === 'string' ? item.channel : '',
+        stock: typeof item?.stock === 'string' ? item.stock : '',
+        priceType: typeof item?.priceType === 'string' ? item.priceType : ''
+    })).filter(item => item.name && item.source && item.channel && item.stock && item.priceType);
+}
+
+function panelCheckoutLoadPresets() {
+    try {
+        return panelCheckoutNormalizePresets(JSON.parse(localStorage.getItem(storageKey(PANEL_CHECKOUT_PRESETS_KEY)) || '[]'));
+    } catch {
+        return [];
+    }
+}
+
+function panelCheckoutSavePresets(presets) {
+    localStorage.setItem(storageKey(PANEL_CHECKOUT_PRESETS_KEY), JSON.stringify(panelCheckoutNormalizePresets(presets)));
+}
+
+function panelCheckoutSelect(id) {
+    return document.getElementById(id);
+}
+
+function panelCheckoutCurrentValues() {
+    const ids = ['clientSourceSelect', 'channelSelect', 'stockSelect', 'priceTypeSelect'];
+    const selects = ids.map(panelCheckoutSelect);
+    if (selects.some(select => !select)) return null;
+    return {
+        source: selects[0].value,
+        channel: selects[1].value,
+        stock: selects[2].value,
+        priceType: selects[3].value,
+        labels: selects.map(select => select.options[select.selectedIndex]?.textContent.trim() || select.value)
+    };
+}
+
+function panelCheckoutWaitFor(predicate, timeout = 10_000, label = 'поле checkout') {
+    const started = Date.now();
+    return new Promise((resolve, reject) => {
+        const check = () => {
+            try {
+                const result = predicate();
+                if (result) return resolve(result);
+            } catch (error) {
+                return reject(error);
+            }
+            if (Date.now() - started >= timeout) return reject(new Error(`Не дождался: ${label}`));
+            setTimeout(check, 200);
+        };
+        check();
+    });
+}
+
+function panelCheckoutSetSelect(id, value) {
+    const select = panelCheckoutSelect(id);
+    if (!select) throw new Error(`Не найдено поле #${id}`);
+    const option = [...select.options].find(item => item.value === value);
+    if (!option) throw new Error(`В поле #${id} нет сохранённого значения`);
+    select.value = option.value;
+    select.dispatchEvent(new Event('input', { bubbles: true }));
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+async function panelCheckoutApplyPreset(preset, statusTarget = null) {
+    const setStatus = message => { if (statusTarget) statusTarget.textContent = message; };
+    try {
+        setStatus(`Применяю «${preset.name}»…`);
+        panelCheckoutSetSelect('clientSourceSelect', preset.source);
+        await panelCheckoutWaitFor(
+            () => panelCheckoutSelect('channelSelect')?.options.length > 0 && !panelCheckoutSelect('channelSelect')?.disabled,
+            10_000,
+            'канал продаж'
+        );
+        panelCheckoutSetSelect('channelSelect', preset.channel);
+        await panelCheckoutWaitFor(() => panelCheckoutSelect('stockSelect')?.options.length > 0, 5_000, 'склад');
+        panelCheckoutSetSelect('stockSelect', preset.stock);
+        await panelCheckoutWaitFor(() => panelCheckoutSelect('priceTypeSelect')?.options.length > 0, 5_000, 'тип цены');
+        panelCheckoutSetSelect('priceTypeSelect', preset.priceType);
+        setStatus(`✅ Применён пресет «${preset.name}»`);
+        return true;
+    } catch (error) {
+        setStatus(`❌ ${error.message}`);
+        return false;
+    }
+}
+
+function panelCheckoutButton(text, title, onClick) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = text;
+    button.title = title;
+    button.style.cssText = 'padding:4px 8px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;font-size:12px;line-height:1;cursor:pointer;';
+    button.addEventListener('click', onClick);
+    return button;
+}
+
+function panelCheckoutOpenPresetDialog() {
+    document.getElementById('mcPanelCheckoutPresetDialog')?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'mcPanelCheckoutPresetDialog';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(15,23,42,.35);';
+    const box = document.createElement('section');
+    box.style.cssText = 'width:min(460px,calc(100vw - 32px));max-height:80vh;overflow:auto;padding:14px;background:#fff;border:1px solid #cbd5e1;border-radius:12px;box-shadow:0 12px 40px rgba(15,23,42,.3);font:13px/1.35 Arial,sans-serif;color:#1f2937;';
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;font-weight:700;';
+    header.textContent = '⚙️ Пресеты checkout';
+    const close = panelCheckoutButton('✕', 'Закрыть', () => overlay.remove());
+    header.appendChild(close);
+    box.appendChild(header);
+
+    const form = document.createElement('div');
+    form.style.cssText = 'display:flex;gap:6px;margin-bottom:10px;';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.placeholder = 'Название нового пресета';
+    nameInput.maxLength = 80;
+    nameInput.style.cssText = 'flex:1;min-width:0;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;';
+    const save = panelCheckoutButton('Сохранить текущие', 'Сохранить текущие значения полей', () => {
+        const current = panelCheckoutCurrentValues();
+        const name = nameInput.value.trim();
+        if (!current) return panelCheckoutDialogStatus.textContent = '❌ Поля checkout ещё не загружены';
+        if (!name) return panelCheckoutDialogStatus.textContent = '❌ Укажите название пресета';
+        const presets = panelCheckoutLoadPresets().filter(item => item.name !== name);
+        presets.push({ id: `preset-${Date.now()}`, name, source: current.source, channel: current.channel, stock: current.stock, priceType: current.priceType });
+        panelCheckoutSavePresets(presets);
+        nameInput.value = '';
+        panelCheckoutRenderPresetList(list, panelCheckoutDialogStatus);
+        panelCheckoutRenderBar();
+        panelCheckoutDialogStatus.textContent = `✅ Сохранён «${name}»`;
+    });
+    form.append(nameInput, save);
+    box.appendChild(form);
+
+    const panelCheckoutDialogStatus = document.createElement('div');
+    panelCheckoutDialogStatus.style.cssText = 'min-height:17px;margin-bottom:7px;color:#64748b;font-size:11px;';
+    box.appendChild(panelCheckoutDialogStatus);
+    const list = document.createElement('div');
+    box.appendChild(list);
+    document.body.appendChild(overlay);
+    overlay.appendChild(box);
+    overlay.addEventListener('click', event => { if (event.target === overlay) overlay.remove(); });
+    panelCheckoutRenderPresetList(list, panelCheckoutDialogStatus);
+}
+
+function panelCheckoutRenderPresetList(list, statusTarget) {
+    list.replaceChildren();
+    const presets = panelCheckoutLoadPresets();
+    if (!presets.length) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding:8px;border:1px dashed #cbd5e1;border-radius:7px;color:#64748b;font-size:11px;';
+        empty.textContent = 'Пресетов пока нет. Выставьте поля и сохраните текущие значения.';
+        list.appendChild(empty);
+        return;
+    }
+    presets.forEach(preset => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:5px;padding:6px 0;border-bottom:1px solid #e5e7eb;';
+        const name = document.createElement('span');
+        name.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        name.textContent = preset.name;
+        const apply = panelCheckoutButton('▶', `Применить «${preset.name}»`, async () => {
+            await panelCheckoutApplyPreset(preset, statusTarget);
+            panelCheckoutRenderBar();
+        });
+        const rename = panelCheckoutButton('✏️', 'Переименовать', () => {
+            const nextName = window.prompt('Новое название пресета', preset.name)?.trim();
+            if (!nextName || nextName === preset.name) return;
+            const updated = panelCheckoutLoadPresets().map(item => item.id === preset.id ? { ...item, name: nextName.slice(0, 80) } : item);
+            panelCheckoutSavePresets(updated);
+            panelCheckoutRenderPresetList(list, statusTarget);
+            panelCheckoutRenderBar();
+        });
+        const remove = panelCheckoutButton('🗑', 'Удалить', () => {
+            panelCheckoutSavePresets(panelCheckoutLoadPresets().filter(item => item.id !== preset.id));
+            panelCheckoutRenderPresetList(list, statusTarget);
+            panelCheckoutRenderBar();
+        });
+        row.append(name, apply, rename, remove);
+        list.appendChild(row);
+    });
+}
+
+function panelCheckoutRenderBar() {
+    const bar = document.getElementById('mcPanelCheckoutPresets');
+    if (!bar) return;
+    const buttons = bar.querySelector('[data-presets-list]');
+    const status = bar.querySelector('[data-presets-status]');
+    buttons.replaceChildren();
+    panelCheckoutLoadPresets().forEach(preset => {
+        const button = panelCheckoutButton(preset.name, `Применить «${preset.name}»`, () => panelCheckoutApplyPreset(preset, status));
+        buttons.appendChild(button);
+    });
+}
+
+function panelCheckoutMountBar() {
+    if (!panelCheckoutPresetsEnabled()) return false;
+    const card = document.querySelector(PANEL_CHECKOUT_CARD_SELECTOR);
+    if (!card) return false;
+    let bar = document.getElementById('mcPanelCheckoutPresets');
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'mcPanelCheckoutPresets';
+        bar.style.cssText = 'display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin:-4px 0 12px;padding:7px 8px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;';
+        const label = document.createElement('span');
+        label.textContent = 'Пресеты:';
+        label.style.cssText = 'font-size:11px;font-weight:700;color:#475569;margin-right:2px;';
+        const list = document.createElement('div');
+        list.dataset.presetsList = '1';
+        list.style.cssText = 'display:flex;gap:4px;flex-wrap:wrap;';
+        const status = document.createElement('span');
+        status.dataset.presetsStatus = '1';
+        status.style.cssText = 'flex:1 1 100%;min-height:14px;color:#64748b;font-size:10px;';
+        const settings = panelCheckoutButton('⚙️', 'Настроить и удалить пресеты', panelCheckoutOpenPresetDialog);
+        const create = panelCheckoutButton('➕', 'Создать пресет из текущих значений', panelCheckoutOpenPresetDialog);
+        bar.append(label, list, settings, create, status);
+        card.prepend(bar);
+    }
+    panelCheckoutRenderBar();
+    return true;
+}
+
+function panelCheckoutStopObserver() {
+    panelCheckoutPresetObserver?.disconnect();
+    panelCheckoutPresetObserver = null;
+}
+
+function initPanelCheckoutPresets() {
+    if (!panelCheckoutPresetsEnabled()) return;
+    const mount = () => panelCheckoutMountBar();
+    mount();
+    if (panelCheckoutPresetObserver || typeof MutationObserver === 'undefined') return;
+    panelCheckoutPresetObserver = new MutationObserver(mount);
+    panelCheckoutPresetObserver.observe(document.body, { childList: true, subtree: true });
 }
 
 // ─── Production entrypoint ───────────────────────────────────────────────────
