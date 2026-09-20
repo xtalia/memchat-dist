@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Panel Enhancer — пресеты checkout
 // @namespace    https://github.com/xtalia/hatiko
-// @version      1.1.0-alpha
+// @version      1.2.0-alpha
 // @description  Пользовательские пресеты и компактный интерфейс для checkout Panel Hatiko
 // @match        https://panel.hatiko.ru/order/checkout*
 // @run-at       document-idle
@@ -98,6 +98,24 @@
         const selects = Object.keys(FIELD_IDS).map(field);
         if (selects.some(select => !select)) return null;
         return Object.fromEntries(Object.keys(FIELD_IDS).map((name, index) => [name, selects[index].value]));
+    }
+
+    function selectedLabel(name) {
+        const select = field(name);
+        return select?.options[select.selectedIndex]?.textContent.trim() || select?.value || '';
+    }
+
+    function autoPresetName(existing) {
+        const labels = Object.keys(FIELD_IDS).map(selectedLabel).filter(Boolean);
+        const base = (`Авто: ${labels.join(' / ')}` || 'Автопресет').slice(0, 80);
+        let index = 1;
+        let candidate = base;
+        while (existing.some(item => item.name === candidate)) {
+            index += 1;
+            const suffix = ` (${index})`;
+            candidate = `${base.slice(0, 80 - suffix.length)}${suffix}`;
+        }
+        return candidate.slice(0, 80);
     }
 
     function waitFor(predicate, timeout, label) {
@@ -229,7 +247,7 @@
         const input = document.createElement('input');
         input.type = 'text';
         input.maxLength = 80;
-        input.placeholder = 'Название нового пресета';
+        input.placeholder = 'Название нового пресета (необязательно)';
         input.style.cssText = 'flex:1;min-width:0;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;';
         const status = document.createElement('div');
         status.style.cssText = 'min-height:17px;margin-bottom:7px;color:#64748b;font-size:11px;';
@@ -259,10 +277,10 @@
         configActions.append(exportButton, importButton);
         const save = button('Сохранить текущие', 'Сохранить текущие значения полей', () => {
             const values = currentValues();
-            const name = input.value.trim();
+            const existing = loadPresets();
+            const name = input.value.trim() || autoPresetName(existing);
             if (!values) return status.textContent = '❌ Поля checkout ещё не загружены';
-            if (!name) return status.textContent = '❌ Укажите название пресета';
-            const presets = loadPresets().filter(item => item.name !== name);
+            const presets = existing.filter(item => item.name !== name);
             presets.push({ id: `preset-${Date.now()}`, name: name.slice(0, 80), ...values });
             if (!savePresets(presets)) return status.textContent = '❌ Не удалось сохранить пресет';
             input.value = '';
