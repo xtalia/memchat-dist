@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.7.0-beta
+// @version      8.8.0-beta
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.7.0-beta';
+const MEMCHAT_VERSION = '8.8.0-beta';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -99,6 +99,7 @@ let currentAction = null;
 // Вкладку «Бонусы» намеренно не персистим — там номера телефонов клиентов (ПДн).
 let chatHistoryByAction = {};
 let clearTextEnabled = false;
+let clearTextDelay = 500;
 let globalClearKeypressBound = false;
 let calcRules     = [];
 let scheduleReplacements = {};
@@ -656,7 +657,7 @@ function addToChatHistory(sender, message, emoji = '', query) {
     if (window.priceCheckContainer) renderChat();
     saveChatHistory(); // персист (кроме вкладки «Бонусы» — ПДн)
     if (sender === 'user' && document.getElementById('clearTextCheckbox')?.checked) {
-        const ms = parseInt(document.getElementById('timeoutSlider')?.value || 500, 10);
+        const ms = clearTextDelay;
         setTimeout(() => { const inp = document.getElementById('priceCheckInput'); if (inp) inp.value = ''; }, ms);
     }
 }
@@ -910,54 +911,58 @@ function checkHatiko() {
 }
 
 function checkHatikoWebsite(query, requestId) {
-    updateHatikoStatus('Ищу товары…');
-
-    // Шаг 1: ищем товар через поиск Саратова
-    const searchUrl = `${BASE_URLS[0]}/search/?query=${encodeURIComponent(query)}`;
-
-    fetchServerData(
-        searchUrl,
-        (searchResp) => {
-            if (requestId !== activeRequestId) return;
-            const products = parseSearchResults(searchResp.responseText, BASE_URLS[0]);
-
-            if (!products.length) {
-                updateHatikoStatus('Товары не найдены');
-                addToChatHistory('bot', 'Товар не найден', '🐶 Hatiko', query);
+    updateHatikoStatus('Ищу товары на сайтах Hatiko…');
+    const searches = BASE_URLS.map(baseUrl => new Promise((resolve, reject) => {
+        const searchUrl = `${baseUrl}/search/?query=${encodeURIComponent(query)}`;
+        fetchServerData(searchUrl, response => resolve({ baseUrl, response }), reject);
+    }));
+    Promise.allSettled(searches).then(outcomes => {
+        if (requestId !== activeRequestId) return;
+        const productsByPath = new Map();
+        const errors = [];
+        outcomes.forEach(outcome => {
+            if (outcome.status === 'rejected') {
+                errors.push(outcome.reason);
                 return;
             }
-
-            updateHatikoStatus(`Найдено товаров: ${products.length}. Получаю цены…`);
-
-            const results = new Array(products.length);
-            let completed = 0;
-
-            products.forEach((product, index) => {
-                checkHatikoProduct(product, result => {
-                    if (requestId !== activeRequestId) return;
-                    results[index] = result;
-                    completed++;
-                    if (completed !== products.length) return;
-
-                    if (results.length === 1) {
-                        lastHatikoResults = results;
-                        lastHatikoQuery = query;
-                        updateHatikoStatus('Готово');
-                        addToChatHistory('bot', results[0].message, '🐶 Hatiko', query);
-                    } else {
-                        lastHatikoResults = results;
-                        lastHatikoQuery = query;
-                        updateHatikoStatus(`Готово: ${results.length} товара. Можно выбрать другой.`);
-                        openHatikoProductPicker(results, query);
-                    }
-                });
+            const { baseUrl, response } = outcome.value;
+            parseSearchResults(response.responseText, baseUrl).forEach(product => {
+                if (!productsByPath.has(product.pathname)) productsByPath.set(product.pathname, product);
             });
-        },
-        (err) => {
-            updateHatikoStatus('Ошибка поиска');
-            addToChatHistory('bot', 'Ошибка поиска: ' + err, '🐶 Hatiko', query);
+        });
+        const products = [...productsByPath.values()];
+        if (!products.length) {
+            updateHatikoStatus(errors.length === BASE_URLS.length ? 'Ошибка поиска' : 'Товары не найдены');
+            addToChatHistory('bot', errors.length === BASE_URLS.length
+                ? 'Не удалось выполнить поиск на сайтах Hatiko'
+                : 'Товар не найден', '🐶 Hatiko', query);
+            return;
         }
-    );
+        updateHatikoStatus(`Найдено товаров: ${products.length}. Получаю цены…`);
+        const results = new Array(products.length);
+        let completed = 0;
+        products.forEach((product, index) => {
+            checkHatikoProduct(product, result => {
+                if (requestId !== activeRequestId) return;
+                results[index] = result;
+                completed++;
+                if (completed !== products.length) return;
+                lastHatikoResults = results;
+                lastHatikoQuery = query;
+                if (results.length === 1) {
+                    updateHatikoStatus('Готово');
+                    addToChatHistory('bot', results[0].message, '🐶 Hatiko', query);
+                } else {
+                    updateHatikoStatus(`Готово: ${results.length} товара. Можно выбрать другой.`);
+                    openHatikoProductPicker(results, query);
+                }
+            });
+        });
+    }).catch(error => {
+        if (requestId !== activeRequestId) return;
+        updateHatikoStatus('Ошибка поиска');
+        addToChatHistory('bot', 'Ошибка поиска: ' + error, '🐶 Hatiko', query);
+    });
 }
 
 function formatPanelSearchResult(data) {
@@ -2102,9 +2107,37 @@ function buildMsQuickPanel() {
 // ─── Очистка текста ───────────────────────────────────────────────────────────
 // Вызывается при каждом открытии окна настроек (элементы создаются заново),
 // поэтому document-слушатель вешается один раз через флаг.
+function loadClearTextDelay() {
+    try {
+        const value = Number(localStorage.getItem(storageKey('clearTextDelay_v1')));
+        clearTextDelay = Number.isInteger(value) && value >= 1 && value <= 2000 ? value : 500;
+    } catch { clearTextDelay = 500; }
+    return clearTextDelay;
+}
+
+function saveClearTextDelay(value) {
+    const delay = Number(value);
+    if (!Number.isInteger(delay) || delay < 1 || delay > 2000) return;
+    clearTextDelay = delay;
+    if (!clearTextEnabled) return;
+    try { localStorage.setItem(storageKey('clearTextDelay_v1'), String(delay)); }
+    catch (error) { debugError('storage', 'Не удалось сохранить задержку очистки', error); }
+}
+
 function setupGlobalClearTextFunctionality() {
     const saved = localStorage.getItem('clearTextEnabled');
     if (saved !== null) clearTextEnabled = saved === 'true';
+    loadClearTextDelay();
+    const slider = document.getElementById('timeoutSlider');
+    const label = document.getElementById('timeoutValue');
+    if (slider) {
+        slider.value = String(clearTextDelay);
+        if (label) label.textContent = slider.value;
+        slider.addEventListener('input', () => {
+            if (label) label.textContent = slider.value;
+            saveClearTextDelay(slider.value);
+        });
+    }
     const cb = document.getElementById('clearTextCheckbox');
     if (cb) {
         cb.checked = clearTextEnabled;
@@ -2116,7 +2149,7 @@ function setupGlobalClearTextFunctionality() {
         globalClearKeypressBound = true;
         document.addEventListener('keypress', e => {
             if (e.key === 'Enter' && clearTextEnabled && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
-                const ms = parseInt(document.getElementById('timeoutSlider')?.value || 500, 10);
+                const ms = clearTextDelay;
                 setTimeout(() => { e.target.value = ''; }, ms);
             }
         });
@@ -2127,6 +2160,7 @@ function setupGlobalClearTextFunctionality() {
 function setClearTextEnabled(enabled) {
     clearTextEnabled = !!enabled;
     localStorage.setItem('clearTextEnabled', String(clearTextEnabled));
+    if (clearTextEnabled) saveClearTextDelay(document.getElementById('timeoutSlider')?.value || clearTextDelay);
     const cb = document.getElementById('clearTextCheckbox');
     if (cb) cb.checked = clearTextEnabled;
     updateClearTextButton();
@@ -3375,7 +3409,7 @@ function initialize() {
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v8.7.0-beta инициализирован');
+    console.log('Мемный чат v8.8.0-beta инициализирован');
 
     // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
     if (/online\.moysklad\.ru$/.test(location.hostname)) {
@@ -3542,40 +3576,180 @@ function hackerEnsureBearer() {
     }
 }
 
-function msApi(method, path, body, onSuccess, onError) {
-    try { hackerEnsureBearer(); }
-    catch (error) { onError(error); return; }
+const MS_API_MAX_CONCURRENT_REQUESTS = 2;
+const MS_API_RATE_SAFETY_FACTOR = 1.2;
+const msApiRequestQueue = [];
+const msApiRateLimitState = {
+    limit: null,
+    remaining: null,
+    intervalMs: null,
+    resetMs: null,
+    retryAfterMs: null,
+    updatedAt: null,
+    parallelLimitErrors: 0
+};
+let msApiInFlight = 0;
+let msApiNextRequestAt = 0;
+let msApiBlockedUntil = 0;
+let msApiParallelCooldownUntil = 0;
+let msApiQueueTimer = null;
+let msApiRateHeadersObserved = false;
+
+function msApiGetLimitStats() {
+    return { ...msApiRateLimitState, inFlight: msApiInFlight, queued: msApiRequestQueue.length };
+}
+
+function msApiParseResponseHeaders(rawHeaders) {
+    const headers = {};
+    String(rawHeaders || '').split(String.fromCharCode(10)).forEach(rawLine => {
+        const line = rawLine.trim();
+        const separator = line.indexOf(':');
+        if (separator < 1) return;
+        headers[line.slice(0, separator).trim().toLowerCase()] = line.slice(separator + 1).trim();
+    });
+    return headers;
+}
+
+function msApiNumberHeader(headers, name) {
+    const value = Number(headers[name]);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function msApiUpdateLimitState(response) {
+    const headers = msApiParseResponseHeaders(response?.responseHeaders);
+    const limit = msApiNumberHeader(headers, 'x-ratelimit-limit');
+    const remaining = msApiNumberHeader(headers, 'x-ratelimit-remaining');
+    const intervalMs = msApiNumberHeader(headers, 'x-lognex-retry-timeinterval');
+    const resetMs = msApiNumberHeader(headers, 'x-lognex-reset');
+    const retryAfterMs = msApiNumberHeader(headers, 'x-lognex-retry-after');
+
+    if (limit !== null) msApiRateLimitState.limit = limit;
+    if (remaining !== null) msApiRateLimitState.remaining = remaining;
+    if (intervalMs !== null) msApiRateLimitState.intervalMs = intervalMs;
+    if (resetMs !== null) msApiRateLimitState.resetMs = resetMs;
+    if (retryAfterMs !== null) msApiRateLimitState.retryAfterMs = retryAfterMs;
+    msApiRateLimitState.updatedAt = Date.now();
+
+    if (limit !== null && limit > 0 && intervalMs !== null && intervalMs > 0) {
+        msApiRateHeadersObserved = true;
+        msApiNextRequestAt = Math.max(msApiNextRequestAt, Date.now() + Math.ceil(intervalMs / limit * MS_API_RATE_SAFETY_FACTOR));
+    }
+    if (remaining === 0) {
+        const waitMs = retryAfterMs || resetMs || intervalMs || 0;
+        if (waitMs > 0) msApiBlockedUntil = Math.max(msApiBlockedUntil, Date.now() + waitMs);
+    }
+    return { headers, rateLimit: { limit, remaining, intervalMs, resetMs, retryAfterMs } };
+}
+
+function msApiScheduleQueue(waitMs) {
+    if (msApiQueueTimer || !msApiRequestQueue.length) return;
+    msApiQueueTimer = setTimeout(() => {
+        msApiQueueTimer = null;
+        msApiPumpQueue();
+    }, Math.max(1, waitMs));
+}
+
+function msApiPumpQueue() {
+    if (!msApiRequestQueue.length) return;
+    const now = Date.now();
+    const cooldownUntil = Math.max(msApiBlockedUntil, msApiParallelCooldownUntil);
+    if (now < cooldownUntil) {
+        msApiScheduleQueue(cooldownUntil - now);
+        return;
+    }
+    const concurrencyLimit = now < msApiParallelCooldownUntil ? 1 : MS_API_MAX_CONCURRENT_REQUESTS;
+    while (msApiRequestQueue.length && msApiInFlight < concurrencyLimit) {
+        const delay = msApiRateHeadersObserved ? msApiNextRequestAt - Date.now() : 0;
+        if (delay > 0) {
+            msApiScheduleQueue(delay);
+            return;
+        }
+        const task = msApiRequestQueue.shift();
+        msApiStartTask(task);
+        if (msApiRateHeadersObserved) {
+            const interval = msApiRateLimitState.intervalMs || 0;
+            const limit = msApiRateLimitState.limit || 0;
+            if (interval > 0 && limit > 0) {
+                msApiNextRequestAt = Date.now() + Math.max(1, Math.ceil(interval / limit * MS_API_RATE_SAFETY_FACTOR));
+            }
+        }
+    }
+}
+
+function msApiStartTask(task) {
+    msApiInFlight += 1;
+    let completed = false;
+    const finish = (callback, value) => {
+        if (completed) return;
+        completed = true;
+        msApiInFlight = Math.max(0, msApiInFlight - 1);
+        callback(value);
+        msApiPumpQueue();
+    };
     const headers = { 'Accept': 'application/json;charset=utf-8' };
-    if (body) headers['Content-Type'] = 'application/json;charset=utf-8';
+    if (task.body) headers['Content-Type'] = 'application/json;charset=utf-8';
     headers['Authorization'] = 'Bearer ' + hackerBearerToken.trim();
-    GM_xmlhttpRequest({
-        method,
-        url: MS_API_BASE + path,
-        headers,
-        data: body ? JSON.stringify(body) : undefined,
-        timeout: 30000,
-        anonymous: false,
-        onload: response => {
-            const raw = response.responseText || '';
-            let data = null;
-            try { data = raw ? JSON.parse(raw) : null; } catch (e) { /* не JSON */ }
-            if (response.status >= 200 && response.status < 300) {
-                if (data && typeof data === 'object') data._status = response.status;
-                onSuccess(data);
-            } else {
-                const apiMsg = data && data.errors && data.errors[0]
-                    ? (data.errors[0].error || data.errors[0].parameter || data.errors[0].code || JSON.stringify(data.errors[0]))
+
+    try {
+        GM_xmlhttpRequest({
+            method: task.method,
+            url: MS_API_BASE + task.path,
+            headers,
+            data: task.body ? JSON.stringify(task.body) : undefined,
+            timeout: 30000,
+            anonymous: false,
+            onload: response => {
+                const raw = response.responseText || '';
+                let data = null;
+                try { data = raw ? JSON.parse(raw) : null; } catch (e) { /* не JSON */ }
+                const limitInfo = msApiUpdateLimitState(response);
+                if (response.status >= 200 && response.status < 300) {
+                    if (data && typeof data === 'object') data._status = response.status;
+                    finish(task.onSuccess, data);
+                    return;
+                }
+                const apiError = data?.errors?.[0] || null;
+                const apiMsg = apiError
+                    ? (apiError.error || apiError.parameter || apiError.code || JSON.stringify(apiError))
                     : '';
                 let msg = apiMsg || ('HTTP ' + response.status);
                 if (response.status === 401 && !hackerBearerEnabled) {
                     msg += ' — включите «Bearer-ключ API» в настройках и вставьте API-ключ';
                 }
-                const err = new Error(msg); err.status = response.status; onError(err);
-            }
-        },
-        onerror: () => onError(new Error('Ошибка сети (api.moysklad.ru)')),
-        ontimeout: () => onError(new Error('Таймаут запроса к api.moysklad.ru'))
-    });
+                const error = new Error(msg);
+                error.status = response.status;
+                error.apiCode = apiError?.code ?? null;
+                error.authCode = limitInfo.headers['x-lognex-auth'] || null;
+                error.rateLimit = limitInfo.rateLimit;
+                const isParallelLimit = response.status === 429
+                    && (Number(error.apiCode) === 1073 || error.authCode === '429005');
+                if (response.status === 429) {
+                    const waitMs = limitInfo.rateLimit.retryAfterMs
+                        || limitInfo.rateLimit.resetMs
+                        || limitInfo.rateLimit.intervalMs
+                        || 1000;
+                    msApiBlockedUntil = Math.max(msApiBlockedUntil, Date.now() + waitMs);
+                }
+                if (isParallelLimit) {
+                    msApiRateLimitState.parallelLimitErrors += 1;
+                    msApiParallelCooldownUntil = Math.max(msApiParallelCooldownUntil, Date.now() + 10000);
+                }
+                finish(task.onError, error);
+            },
+            onerror: () => finish(task.onError, new Error('Ошибка сети (api.moysklad.ru)')),
+            ontimeout: () => finish(task.onError, new Error('Таймаут запроса к api.moysklad.ru')),
+            onabort: () => finish(task.onError, new Error('Запрос к api.moysklad.ru отменён'))
+        });
+    } catch (error) {
+        finish(task.onError, error);
+    }
+}
+
+function msApi(method, path, body, onSuccess, onError) {
+    try { hackerEnsureBearer(); }
+    catch (error) { onError(error); return; }
+    msApiRequestQueue.push({ method, path, body, onSuccess, onError });
+    msApiPumpQueue();
 }
 
 function msApiP(method, path, body) {
@@ -3967,7 +4141,13 @@ function hackerBuildAgentTab() {
 // ─── Справочники для «Автопродажи» ────────────────────────────────────────────
 function hackerApiPath(href) {
     if (!href) return '';
-    return href.startsWith(MS_API_BASE) ? href.slice(MS_API_BASE.length) : href;
+    try {
+        const value = String(href);
+        const url = new URL(value.startsWith('/') ? MS_API_BASE + value : value, MS_API_BASE + '/');
+        const base = new URL(MS_API_BASE);
+        if (url.origin !== base.origin || !url.pathname.startsWith(base.pathname + '/')) return '';
+        return url.pathname.slice(base.pathname.length) + url.search;
+    } catch { return ''; }
 }
 
 function hackerMetaRef(href, type) {
@@ -5804,6 +5984,22 @@ function internalOrderCheckMatchesWarehouse(entity, row, warehouseHref) {
     return references.some(reference => reference?.meta?.href === warehouseHref);
 }
 
+function internalOrderCheckFetchAllPages(path, rows = [], visited = new Set()) {
+    const normalizedPath = hackerApiPath(path);
+    if (!normalizedPath || visited.has(normalizedPath)) {
+        return Promise.reject(new Error('МойСклад вернул циклическую ссылку пагинации'));
+    }
+    visited.add(normalizedPath);
+    return msApiP('GET', normalizedPath).then(page => {
+        const pageRows = Array.isArray(page?.rows) ? page.rows : [];
+        rows.push(...pageRows);
+        const nextHref = page?.meta?.nextHref;
+        return nextHref
+            ? internalOrderCheckFetchAllPages(nextHref, rows, visited)
+            : rows;
+    });
+}
+
 function internalOrderCheckFetchDocuments(entity, organizationHref, warehouseHref, statusHrefs) {
     if (!organizationHref) return Promise.reject(new Error(`Не выбрана организация: ${INTERNAL_ORDER_CHECK_ENTITIES[entity].label}`));
     if (!warehouseHref) return Promise.reject(new Error(`Не выбран склад: ${INTERNAL_ORDER_CHECK_ENTITIES[entity].label}`));
@@ -5818,8 +6014,7 @@ function internalOrderCheckFetchDocuments(entity, organizationHref, warehouseHre
         statusNames,
         path
     });
-    return msApiP('GET', path).then(data => {
-        const rows = Array.isArray(data?.rows) ? data.rows : [];
+    return internalOrderCheckFetchAllPages(path).then(rows => {
         const matching = rows.filter(row =>
             internalOrderCheckMatchesStatus(row, statusHrefs, statusNames)
             && internalOrderCheckMatchesWarehouse(entity, row, warehouseHref));
@@ -5832,11 +6027,13 @@ function internalOrderCheckFetchDocuments(entity, organizationHref, warehouseHre
 }
 
 function internalOrderCheckPositionRows(entity, document) {
-    if (Array.isArray(document?.positions?.rows)) return Promise.resolve(document.positions.rows);
+    const initialRows = Array.isArray(document?.positions?.rows) ? document.positions.rows : [];
+    const nextHref = document?.positions?.meta?.nextHref;
+    if (nextHref) return internalOrderCheckFetchAllPages(nextHref, initialRows);
+    if (Array.isArray(document?.positions?.rows)) return Promise.resolve(initialRows);
     const id = document?.id || document?.meta?.href?.split('/').pop();
     if (!id) return Promise.resolve([]);
-    return msApiP('GET', `/entity/${entity}/${id}/positions?expand=assortment&limit=1000`)
-        .then(data => Array.isArray(data?.rows) ? data.rows : []);
+    return internalOrderCheckFetchAllPages(`/entity/${entity}/${id}/positions?expand=assortment&limit=1000`);
 }
 
 function internalOrderCheckPositionKey(position) {
@@ -5944,17 +6141,32 @@ function internalOrderCheckShowResult(result) {
 }
 
 async function internalOrderCheckCollectGoods(entity, documents) {
-    const goods = [];
-    for (const document of documents) {
-        try {
-            const positions = await internalOrderCheckPositionRows(entity, document);
-            goods.push(...positions);
-            internalOrderCheckTrace(`${document.name || document.id}: получено позиций — ${positions.length}`);
-        } catch (error) {
-            internalOrderCheckTrace(`${document.name || document.id}: не удалось получить позиции`, error, 'err');
+    const outcomes = new Array(documents.length);
+    let nextIndex = 0;
+    const worker = async () => {
+        while (nextIndex < documents.length) {
+            const index = nextIndex++;
+            const document = documents[index];
+            try {
+                const positions = await internalOrderCheckPositionRows(entity, document);
+                internalOrderCheckTrace(`${document.name || document.id}: получено позиций — ${positions.length}`);
+                outcomes[index] = { document, positions, error: null };
+            } catch (error) {
+                internalOrderCheckTrace(`${document.name || document.id}: не удалось получить позиции`, error, 'err');
+                outcomes[index] = { document, positions: [], error };
+            }
         }
+    };
+    const workerCount = Math.min(MS_API_MAX_CONCURRENT_REQUESTS, documents.length);
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    const failures = outcomes.filter(outcome => outcome.error);
+    if (failures.length) {
+        const error = new Error(`Не удалось полностью загрузить позиции для ${failures.length} из ${documents.length} документов`);
+        error.partialFailure = true;
+        error.failedDocuments = failures.map(outcome => outcome.document.name || outcome.document.id || 'Без названия');
+        throw error;
     }
-    return internalOrderCheckAggregate(goods);
+    return internalOrderCheckAggregate(outcomes.flatMap(outcome => outcome.positions));
 }
 
 async function internalOrderCheckCompare() {
@@ -5996,8 +6208,11 @@ async function internalOrderCheckCompare() {
         setStatus(`Готово: добавлено ${result.added.length}, упущено ${result.missed.length}`);
         return result;
     } catch (error) {
+        const message = error.partialFailure
+            ? `Данные неполные, сравнение отменено. Ошибка загрузки: ${error.failedDocuments.join(', ')}`
+            : error.message || String(error);
         internalOrderCheckTrace('Сравнение не выполнено', error, 'err');
-        setStatus(error.message || String(error), 'err');
+        setStatus(message, 'err');
         return null;
     } finally {
         if (compare) compare.disabled = false;
