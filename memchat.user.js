@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Мемный чат с калькулятором
 // @namespace    http://tampermonkey.net/
-// @version      8.6.0-alpha
+// @version      8.7.0-beta
 // @description  Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер
 // @match        https://online.moysklad.ru/*
 // @match        https://*.bitrix24.ru/*
@@ -26,7 +26,7 @@
 
 'use strict';
 
-const MEMCHAT_VERSION = '8.6.0-alpha';
+const MEMCHAT_VERSION = '8.7.0-beta';
 
 // Режимные вкладки: Enter в поле ввода выполняет действие. Вкладки-действия
 // (today/tomorrow/hacker) и «Настройки» открывают окно/контент по клику.
@@ -1040,19 +1040,36 @@ function calculateCredit() {
     const input = document.getElementById('priceCheckInput').value.trim();
     if (!input) return;
     addToChatHistory('user', input, '🧮 Калькулятор');
-    const cash = parseFloat(input);
-    if (isNaN(cash) || cash <= 0) {
-        addToChatHistory('bot', 'Ошибка: введите корректную сумму.', '🧮 Калькулятор', input);
+
+    const downPaymentMatch = input.match(/^\s*(\d+(?:[.,]\d+)?)\s*-\s*(\d+(?:[.,]\d+)?)\s*$/);
+    const total = downPaymentMatch ? Number(downPaymentMatch[1].replace(',', '.')) : null;
+    const downPayment = downPaymentMatch ? Number(downPaymentMatch[2].replace(',', '.')) : null;
+    const amount = downPaymentMatch ? total - downPayment : parseFloat(input);
+
+    if (isNaN(amount) || amount <= 0) {
+        const error = downPaymentMatch
+            ? 'Ошибка: первоначальный взнос должен быть больше 0 и меньше общей суммы.'
+            : 'Ошибка: введите корректную сумму.';
+        addToChatHistory('bot', error, '🧮 Калькулятор', input);
         return;
     }
-    const lines = calcRules.map(rule => {
-            const result = applyRule(cash, rule);
-            return rule.isCashback
-                ? `💸 ${rule.name}: ${result} баллами`
-                : `🔹 ${rule.name}: ${result} руб.`;
-        });
-        addToChatHistory('bot', lines.join('\n'), '🧮 Калькулятор', input);
+    if (downPaymentMatch && (!Number.isFinite(total) || !Number.isFinite(downPayment) || downPayment <= 0 || downPayment >= total)) {
+        addToChatHistory('bot', 'Ошибка: первоначальный взнос должен быть больше 0 и меньше общей суммы.', '🧮 Калькулятор', input);
+        return;
     }
+
+    const lines = [];
+    if (downPaymentMatch) {
+        lines.push(`Первоначальный взнос: ${downPayment} руб.`, `Остаток: ${amount} руб.`);
+    }
+    lines.push(...calcRules.map(rule => {
+        const result = applyRule(amount, rule);
+        if (rule.isCashback) return `💸 ${rule.name}: ${result} баллами`;
+        const totalWithDownPayment = downPaymentMatch ? ` (${result + downPayment} руб. с первоначальным взносом)` : '';
+        return `🔹 ${rule.name}: ${result} руб.${totalWithDownPayment}`;
+    }));
+    addToChatHistory('bot', lines.join('\n'), '🧮 Калькулятор', input);
+}
 
 function calculateReverse() {
     const input = document.getElementById('priceCheckInput').value.trim();
@@ -3358,7 +3375,7 @@ function initialize() {
         GM_registerMenuCommand('Сбросить положение окон', resetFloatWindowPos);
         GM_registerMenuCommand('Переключить отладку мемного чата', toggleDebugMode);
     debugLog('init', 'initialized');
-    console.log('Мемный чат v8.6.0-alpha инициализирован');
+    console.log('Мемный чат v8.7.0-beta инициализирован');
 
     // Один наблюдатель обслуживает все контекстные встройки и SPA-переходы.
     if (/online\.moysklad\.ru$/.test(location.hostname)) {
