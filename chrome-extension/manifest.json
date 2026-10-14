@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Хатико · Memchat",
+  "description": "Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер",
+  "version": "8.8.0",
+  "version_name": "8.8.0-beta",
+  "minimum_chrome_version": "120",
+  "host_permissions": [
+    "https://*.bitrix24.ru/*",
+    "https://*.hatiko.ru/*",
+    "https://api.moysklad.ru/*",
+    "https://docs.google.com/*",
+    "https://github.com/*",
+    "https://hatiko.ru/*",
+    "https://online.moysklad.ru/*",
+    "https://panel.hatiko.ru/*",
+    "https://raw.githubusercontent.com/*"
+  ],
+  "permissions": [
+    "activeTab",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "background": {
+    "service_worker": "worker.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Хатико · Memchat"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://online.moysklad.ru/*",
+        "https://*.bitrix24.ru/*",
+        "https://*.hatiko.ru/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

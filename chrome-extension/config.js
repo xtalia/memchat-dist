@@ -1,0 +1,1 @@
+const MEMCHAT_EXTENSION_CONFIG = {"networkHosts": ["hatiko.ru", "*.hatiko.ru", "panel.hatiko.ru", "docs.google.com", "github.com", "raw.githubusercontent.com", "api.moysklad.ru"], "pageMatches": ["https://online.moysklad.ru/*", "https://*.bitrix24.ru/*", "https://*.hatiko.ru/*"]};
