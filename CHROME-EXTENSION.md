@@ -1,6 +1,6 @@
 # Хатико · Memchat для Chrome
 
-Автономное расширение Chrome **Manifest V3**, версия `8.8.0-beta`. Содержит production `memchat.user.js`: те же вкладки, калькуляторы, поиск Hatiko/Panel, расписание и функции МойСклад. Tampermonkey для этой версии не нужен.
+Автономное расширение Chrome **Manifest V3**, версия `8.8.0.1` (`8.8.0-beta-chrome.1`). Содержит неизменённый production `memchat.user.js` версии `8.8.0-beta`: те же вкладки, калькуляторы, поиск Hatiko/Panel, расписание и функции МойСклад. Tampermonkey не нужен.
 
 ## Установка
 
@@ -9,7 +9,10 @@
 3. Открыть `chrome://extensions`, включить **Режим разработчика**.
 4. Нажать **Загрузить распакованное расширение**, выбрать внутреннюю папку `chrome-extension` с `manifest.json`, не ZIP и не родительскую папку.
 5. Перезагрузить рабочие вкладки МойСклад, Bitrix24 или Hatiko.
-6. Закрепить расширение в панели Chrome. Нажать его значок → **Открыть мемный чат**.
+6. Закрепить расширение в панели Chrome. **ЛКМ по значку** создаёт/показывает основное окно; повторный клик скрывает его. Popup-меню отсутствует.
+7. **ПКМ по значку → Сбросить положение окон** возвращает основное и открытые плавающие окна в исходное положение, удаляет сохранённую позицию. История, введённый текст и настройки не очищаются.
+
+Переключение видимости касается только основного окна: окна настроек и прочие плавающие окна не закрываются. Пункт отладки убран из управления расширением; общий код userscript не изменён. На неподдерживаемой странице или при необходимости перезагрузки значок показывает `!`; подсказка при наведении объясняет причину.
 
 Chrome 120+; на Chromium 151 пакет проверен в headless-режиме. Установка в основном профиле пользователя не выполнялась.
 
@@ -28,9 +31,10 @@ Chrome 120+; на Chromium 151 пакет проверен в headless-режи�
 
 ## Разрешения
 
-- Site access: `online.moysklad.ru`, `*.bitrix24.ru`, `*.hatiko.ru` — только исходные `@match` сайта для content script и чтения URL рабочей вкладки popup-ом.
+- Site access: `online.moysklad.ru`, `*.bitrix24.ru`, `*.hatiko.ru` — только исходные `@match` сайта для content script и управления текущей рабочей вкладкой.
 - Network access: исходные `@connect` (`hatiko.ru` и поддомены, Panel, `docs.google.com`, GitHub/raw, `api.moysklad.ru`).
 - `activeTab` — действие по текущей рабочей вкладке; broad `tabs` не запрашивается.
+- `contextMenus` — единственный собственный пункт «Сбросить положение окон» в ПКМ-меню значка расширения, не в меню страницы.
 - `declarativeNetRequestWithHostAccess` — выставление фиксированных Origin/Referer для **собственных** запросов расширения к Panel; отдельное правило блокирует внешние redirect destinations. Обычные запросы страниц не переписываются.
 - Нет `<all_urls>`, `cookies`, `webRequest`, `scripting`, clipboard permission или externally_connectable.
 
@@ -39,7 +43,7 @@ Chrome 120+; на Chromium 151 пакет проверен в headless-режи�
 - `content.js`: isolated-world IIFE, GM-адаптер и production userscript.
 - `worker.js`: проверенный по sender/domain/method GM transport. Cookie-сессии передаются через `credentials: include`; `anonymous` использует `omit`. Bearer разрешён только для `api.moysklad.ru`.
 - `config.js`: allowlists из metadata userscript.
-- `popup.html/js/css`: зарегистрированные GM-menu actions без eval и page postMessage bridge.
+- `controls.js`: Chrome action/context-menu обработчики; управление через private runtime channel без popup, eval и page postMessage bridge. GM-menu регистрации userscript не экспортируются.
 - `build-info.json`: версия и SHA-256 точного production input.
 
 Таймаут отдельного запроса ограничен 30 секундами с учётом lifecycle MV3. Табличные/фоновые функции core продолжают жить в открытой вкладке, а не в постоянно работающем worker. Закрытие/заморозка рабочей вкладки останавливает их, как и у userscript; это не сервер мониторинга.
@@ -58,9 +62,9 @@ node extension/smoke.cjs
 npm test
 ```
 
-`build.py` не пересобирает и не меняет userscript: получает уже собранный production input. Это позволяет не включать незавершённые src-изменения в extension release. Артефакты: `extension/dist/chrome-extension/` и `extension/dist/memchat-chrome.zip`. ZIP детерминированный; зависимости для Python-сборки не нужны.
+`build.py` не пересобирает и не меняет userscript: получает уже собранный production input. Это позволяет не включать незавершённые src-изменения в extension release. Артефакты: `extension/dist/chrome-extension/` и `extension/dist/memchat-chrome.zip`. ZIP детерминированный; зависимости для Python-сборки не нужны. Четвёртый компонент Chrome version — revision адаптера, независимый от версии core. При пересборке удаляются известные retired popup-файлы; при ручном обновлении установленной папки тоже удалите `popup.html`, `popup.js`, `popup.css`, если они остались от первой версии.
 
-Smoke использует уже установленный Playwright и отдельный временный headless Chromium профиль. Пути можно задать переменными `MEMCHAT_PLAYWRIGHT` и `MEMCHAT_CHROMIUM`. Он проверяет действительную загрузку пакета, popup, калькулятор, сохранение состояния, runtime HTTP channel, публичный GitHub redirect и live `hatiko.ru`; пользовательский профиль и бизнес-документы не меняет.
+Smoke использует уже установленный Playwright и отдельный временный headless Chromium профиль. Пути можно задать переменными `MEMCHAT_PLAYWRIGHT` и `MEMCHAT_CHROMIUM`. Он проверяет действительную загрузку пакета, native-menu регистрацию, переключение видимости, сброс позиций, сохранение текста/истории/настроек, калькулятор, runtime HTTP channel, публичный GitHub redirect и live `hatiko.ru`. В headless нет видимого toolbar: вызываются те же функции, которые зарегистрированы в Chrome action/context-menu событиях, с настоящими tabs/runtime APIs и content scripts. Пользовательский профиль и бизнес-документы не меняются.
 
 ## Границы проверки первого релиза
 

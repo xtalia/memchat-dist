@@ -112,3 +112,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     performRequest(message, sender).then(sendResponse, () => sendResponse({ event: 'error', error: 'Недопустимый запрос расширения' }));
     return true;
 });
+
+// Register toolbar/context-menu listeners synchronously on every worker wake.
+importScripts('controls.js');

@@ -1,7 +1,6 @@
 (() => {
 'use strict';
 // This file and the production userscript share one isolated-world IIFE.
-const extensionMenus = new Map();
 let extensionRequestSequence = 0;
 
 function GM_xmlhttpRequest(options) {
@@ -31,11 +30,9 @@ function GM_xmlhttpRequest(options) {
     } };
 }
 
-function GM_registerMenuCommand(label, callback) {
-    const id = String(extensionMenus.size + 1);
-    extensionMenus.set(id, { label: String(label), callback });
-    return id;
-}
+// Userscript menu registrations are intentionally not exposed by the extension.
+// Toolbar toggle and the single action-context menu replace them; no debug item.
+function GM_registerMenuCommand() { return null; }
 
 // Only the schedule module uses fetch. Route it through the same privileged
 // transport rather than relying on page-origin CORS permissions.
@@ -62,15 +59,27 @@ function fetch(url, options = {}) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('popup.html')) return false;
+    if (sender.id !== chrome.runtime.id || sender.tab
+        || (sender.url && sender.url !== chrome.runtime.getURL('worker.js'))) return false;
+    if (!['memchat:toggle', 'memchat:reset-position'].includes(message?.type)) return false;
     const conflict = Boolean(document.getElementById('priceCheckContainer') && !window.priceCheckContainer);
-    if (message?.type === 'memchat:menus') {
-        sendResponse({ menus: [...extensionMenus].map(([id, entry]) => ({ id, label: entry.label })), conflict });
-    } else if (message?.type === 'memchat:menu') {
-        const entry = extensionMenus.get(String(message.id));
-        if (!entry || conflict) { sendResponse({ ok: false }); return false; }
-        try { entry.callback(); sendResponse({ ok: true }); }
-        catch { sendResponse({ ok: false }); }
+    if (conflict) { sendResponse({ ok: false, reason: 'conflict' }); return false; }
+    try {
+        if (message.type === 'memchat:toggle') {
+            const main = window.priceCheckContainer;
+            if (!main) createPriceCheckWindow();
+            else main.style.display = getComputedStyle(main).display === 'none' ? 'flex' : 'none';
+        } else {
+            resetFloatWindowPos();
+            const main = window.priceCheckContainer;
+            if (main) Object.assign(main.style, { left: 'auto', top: '14px', right: '14px', bottom: 'auto' });
+            document.querySelectorAll('.mc-float-window').forEach(element => {
+                ['left', 'top', 'right', 'bottom'].forEach(key => element.style.removeProperty(key));
+            });
+        }
+        sendResponse({ ok: true });
+    } catch {
+        sendResponse({ ok: false, reason: 'failed' });
     }
     return false;
 });
