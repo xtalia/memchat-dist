@@ -1,0 +1,3 @@
+# Built extension files must match the ZIP byte-for-byte on Windows.
+chrome-extension/* -text
+memchat-chrome.zip -text
