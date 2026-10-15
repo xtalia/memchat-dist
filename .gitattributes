@@ -1,3 +1,8 @@
 # Built extension files must match the ZIP byte-for-byte on Windows.
 chrome-extension/* -text
 memchat-chrome.zip -text
+Update-Memchat.ps1 -text
+Update-Memchat.cmd -text
+Update-Memchat.command -text
+update-memchat.sh -text
+memchat-update.txt -text
