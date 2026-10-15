@@ -1,0 +1,10 @@
+MEMCHAT_UPDATE_V1
+version=8.8.0.3
+sha256=c61718e95481bb9e4e80a598f15d5e56d8c36306d34ef110ab00b9bf2aa9e524
+url=https://github.com/xtalia/memchat-dist/releases/download/chrome-v8.8.0.3/memchat-chrome.zip
+file.build-info.json=30c370b222b83c84ac85d8bf166010841bcd9271210f4aa6ae09d844c5892511
+file.config.js=aa96d8703da45b2632ff33b60939cf3c3138be91bfd576696b672ab65ab55b21
+file.content.js=ee02ac7046228f01d94c0c98ba8d06654e7ca601ebb81f7ca2b5c9768711f841
+file.controls.js=17359c94ab319990a7aed7914f624764d76a43496315f7210b01fc6355aa5b5e
+file.manifest.json=e3a6baa293d814b38012d9ccd27ddf21bcf4a1a89957d281cfca4978067bc96b
+file.worker.js=554b85fc9c7153e2d0ac2327df33863e08aea9116b44629cb646a6121768a231
