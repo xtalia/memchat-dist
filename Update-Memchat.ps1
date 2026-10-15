@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$TargetDirectory = (Join-Path $PSScriptRoot 'chrome-extension'),
+    [string]$TargetDirectory,
     [string]$OfflineIndex,
     [string]$OfflineArchive
 )
@@ -237,6 +237,10 @@ function Assert-ZipAndStage([byte[]]$ArchiveBytes, [hashtable]$Index, [string]$S
 }
 
 try {
+    # Windows PowerShell 5.1 initializes PSScriptRoot after default binding.
+    if (-not $PSBoundParameters.ContainsKey('TargetDirectory')) {
+        $TargetDirectory = Join-Path $PSScriptRoot 'chrome-extension'
+    }
     if (($OfflineIndex -and -not $OfflineArchive) -or ($OfflineArchive -and -not $OfflineIndex)) {
         Stop-Updater 'OfflineIndex and OfflineArchive must be supplied together.'
     }
