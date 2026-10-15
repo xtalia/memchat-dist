@@ -6366,4 +6366,193 @@ function hackerBuildInternalOrderCheckTab() {
 
 // ─── Production entrypoint ───────────────────────────────────────────────────
 initialize();
+// Extension-only adaptations, installed after the unchanged production core.
+// Tokens travel only over Chrome's private isolated-world runtime channel.
+function extensionPanelCsrf(onSuccess, onError, force) {
+    let finished = false;
+    const finish = result => {
+        if (finished) return;
+        finished = true;
+        if (chrome.runtime.lastError) {
+            onError?.(new Error('Расширение обновлено или недоступно. Перезагрузите вкладку.'));
+        } else if (result?.ok && typeof result.token === 'string' && /^[A-Za-z0-9_-]{16,512}$/.test(result.token)) {
+            onSuccess?.(result.token);
+        } else {
+            onError?.(new Error(result?.error || 'Panel: фоновая сессия недоступна. Войдите в panel.hatiko.ru.'));
+        }
+    };
+    try { chrome.runtime.sendMessage({ type: 'memchat:panel-csrf', force }, finish); }
+    catch { finish({ ok: false, error: 'Расширение недоступно. Перезагрузите вкладку.' }); }
+}
+
+// Remove the old site-owned token on this origin, without touching settings/history.
+clearPanelCsrf();
+loadPanelCsrf = () => '';
+savePanelCsrf = () => {};
+refreshPanelCsrf = (onSuccess, onError) => extensionPanelCsrf(onSuccess, onError, true);
+ensurePanelCsrf = (onSuccess, onError, force = false) => extensionPanelCsrf(onSuccess, onError, force === true);
+// Missing/expired auth is reported by the existing core; no surprise tabs/popups.
+openPanelInBackground = () => {};
+
+/* Extension-only Memchat UI promotion. Include after the production userscript body. */
+(() => {
+    'use strict';
+    if (!document.body || typeof document.createElement('div').showPopover !== 'function' || document.querySelector('[data-memchat-top-layer]')) return;
+
+    const ROOT_SELECTOR = [
+        '#priceCheckContainer', '.mc-float-window', '.mc-overlay', '#hatikoProductPicker',
+        '#mcHackerQuickPopup', '#mcHackerAgentPopup', '#mcHackerFloatingLog', '#mcMsToast',
+        '#mcOrderStatusPopup', '#mcMagicPopup'
+    ].join(',');
+    const host = document.createElement('div');
+    host.setAttribute('data-memchat-top-layer', '');
+    host.setAttribute('popover', 'manual');
+    host.setAttribute('aria-label', 'Memchat');
+    const style = document.createElement('style');
+    style.textContent = `
+      [data-memchat-top-layer] { position:fixed !important; inset:0 !important; z-index:2147483647 !important; margin:0 !important; padding:0 !important; border:0 !important; width:auto !important; height:auto !important; max-width:none !important; max-height:none !important; overflow:visible !important; background:transparent !important; color:inherit; pointer-events:none !important; }
+      [data-memchat-top-layer]::backdrop { background:transparent !important; pointer-events:none !important; }
+      [data-memchat-top-layer] > * { pointer-events:auto !important; }
+    `;
+    host.appendChild(style);
+    document.body.appendChild(host);
+
+    let scheduled = false;
+    let forcePromotion = false;
+    let scheduledTimer = 0;
+    let lastModal = null;
+    let lastFullscreen = null;
+    let externalTopLayerTimer = 0;
+    const modalOrder = [];
+
+    function isModal(dialog) {
+        try { return dialog.matches(':modal'); } catch (_) { return false; }
+    }
+
+    function activeModal() {
+        const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+        const modals = dialogs.filter(isModal);
+        for (let i = modalOrder.length - 1; i >= 0; i--) {
+            if (!modals.includes(modalOrder[i])) modalOrder.splice(i, 1);
+        }
+        for (const dialog of modals) if (!modalOrder.includes(dialog)) modalOrder.push(dialog);
+        const focused = document.activeElement;
+        const focusedModals = modals.filter(dialog => dialog.contains(focused));
+        if (focusedModals.length) {
+            return focusedModals.reduce((deepest, dialog) => deepest.contains(dialog) ? dialog : deepest);
+        }
+        return modalOrder.length ? modalOrder[modalOrder.length - 1] : null;
+    }
+
+    function promote() {
+        if (typeof host.showPopover !== 'function') return;
+        try {
+            if (host.matches(':popover-open')) host.hidePopover();
+            host.showPopover();
+        } catch (_) {
+            // Leave the host mounted; unsupported/blocked popover APIs cannot be forced.
+        }
+    }
+
+    function withOwnedFocus(action, ownedRoot = host) {
+        const focused = ownedRoot.contains(document.activeElement) ? document.activeElement : null;
+        const start = focused && typeof focused.selectionStart === 'number' ? focused.selectionStart : null;
+        const end = focused && typeof focused.selectionEnd === 'number' ? focused.selectionEnd : null;
+        const direction = focused && focused.selectionDirection;
+        action();
+        if (!focused || !focused.isConnected || document.activeElement === focused) return;
+        // Reparenting and popover toggling may blur an owned control to body. Never
+        // override a different page control that acquired focus during the action.
+        if (document.activeElement !== document.body && document.activeElement !== document.documentElement) return;
+        try { focused.focus({ preventScroll: true }); } catch (_) { try { focused.focus(); } catch (_) {} }
+        if (start !== null && typeof focused.setSelectionRange === 'function') {
+            try { focused.setSelectionRange(start, end, direction); } catch (_) {}
+        }
+    }
+
+    function moveHost(parent) {
+        if (!parent || host.parentElement === parent) return;
+        parent.appendChild(host);
+    }
+
+    function collectRoots() {
+        for (const node of document.querySelectorAll(ROOT_SELECTOR)) {
+            if (node === host || host.contains(node)) continue;
+            withOwnedFocus(() => host.appendChild(node), node);
+        }
+    }
+
+    function sync() {
+        scheduled = false;
+        scheduledTimer = 0;
+        const shouldPromote = forcePromotion;
+        forcePromotion = false;
+        if (!document.body.isConnected) return;
+        if (!host.isConnected) document.body.appendChild(host);
+        const fullscreen = document.fullscreenElement || null;
+        const modal = activeModal();
+        const parent = fullscreen ? (modal && fullscreen.contains(modal) ? modal : fullscreen) : (modal || document.body);
+        withOwnedFocus(() => {
+            moveHost(parent);
+            if (fullscreen !== lastFullscreen || modal !== lastModal || host.parentElement !== parent || shouldPromote) promote();
+        });
+        if (fullscreen !== lastFullscreen || modal !== lastModal || host.parentElement !== parent) {
+            lastFullscreen = fullscreen;
+            lastModal = modal;
+        }
+        collectRoots();
+        if (!host.matches(':popover-open')) withOwnedFocus(promote);
+    }
+
+    function schedule(force = false) {
+        forcePromotion = forcePromotion || force === true;
+        if (scheduled) return;
+        scheduled = true;
+        scheduledTimer = window.setTimeout(sync, 0);
+    }
+
+    promote();
+    collectRoots();
+    const observer = new MutationObserver(records => {
+        for (const record of records) {
+            if (record.type !== 'attributes' || record.attributeName !== 'open' || record.target.localName !== 'dialog') continue;
+            const dialog = record.target;
+            const index = modalOrder.indexOf(dialog);
+            if (!dialog.hasAttribute('open') || !isModal(dialog)) {
+                if (index !== -1) modalOrder.splice(index, 1);
+            } else {
+                if (index !== -1) modalOrder.splice(index, 1);
+                modalOrder.push(dialog);
+            }
+        }
+        schedule();
+    });
+    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['open', 'style', 'class'] });
+    document.addEventListener('toggle', schedule, true);
+    document.addEventListener('fullscreenchange', schedule, true);
+    document.addEventListener('webkitfullscreenchange', schedule, true);
+    window.addEventListener('pagehide', () => {
+        observer.disconnect();
+        window.clearTimeout(scheduledTimer);
+        window.clearTimeout(externalTopLayerTimer);
+        scheduled = false;
+    }, { once: true });
+    window.addEventListener('pageshow', event => {
+        if (!event.persisted) return;
+        observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['open', 'style', 'class'] });
+        schedule();
+    });
+    // A later page popover/dialog enters above an earlier popover. Re-promote after its toggle.
+    document.addEventListener('toggle', event => {
+        if (event.target === host || !event.target || host.contains(event.target)) return;
+        window.clearTimeout(externalTopLayerTimer);
+        externalTopLayerTimer = window.setTimeout(() => {
+            const modal = activeModal();
+            if (modal || document.fullscreenElement) schedule(true);
+            else withOwnedFocus(promote);
+        }, 0);
+    }, true);
+    window.__memchatTopLayer = { host, refresh: schedule };
+})();
+
 })();

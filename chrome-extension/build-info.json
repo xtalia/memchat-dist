@@ -1,6 +1,6 @@
 {
-  "version": "8.8.0-beta-chrome.1",
+  "version": "8.8.0-beta-chrome.2",
   "source_version": "8.8.0-beta",
   "source": "js/memchat.user.js",
-  "source_sha256": "1d66549a6defc85c63f67d07b5fd6f3b1bb3f860fc4f69d64a0e03cfff416fbc"
+  "source_sha256": "533abb2ce118ffc5fc775744f0db6bbbfc139f903b4fc2fcefd535b54d7a6080"
 }
