@@ -86,11 +86,11 @@ fi
 # Strictly validate the descriptor; never source or evaluate it.
 awk '
 BEGIN { valid=1 }
-NR == 1 { sub(/\r$/, "", $0); if ($0 != "MEMCHAT_UPDATE_V1") valid=0; next }
+NR == 1 { sub(/\r$/, "", $0); v2=($0 == "MEMCHAT_UPDATE_V2"); if ($0 != "MEMCHAT_UPDATE_V1" && !v2) valid=0; next }
 {
   sub(/\r$/, "", $0)
   key=substr($0,1,index($0,"=")-1); value=substr($0,index($0,"=")+1)
-  if (!(key == "version" || key == "sha256" || key == "url" || key == "file.build-info.json" || key == "file.config.js" || key == "file.content.js" || key == "file.controls.js" || key == "file.manifest.json" || key == "file.worker.js") || seen[key]++) { valid=0; next }
+  if (!(key == "version" || key == "sha256" || key == "url" || key == "file.build-info.json" || key == "file.config.js" || key == "file.content.js" || key == "file.controls.js" || key == "file.manifest.json" || key == "file.worker.js" || (v2 && key == "file.icon.png")) || seen[key]++) { valid=0; next }
   if (key == "version") {
     n=split(value,a,"."); if (n != 4) valid=0
     for (i=1;i<=n;i++) if (a[i] !~ /^[0-9]+$/ || length(a[i]) > 5 || a[i]+0 > 65535) valid=0
@@ -98,13 +98,16 @@ NR == 1 { sub(/\r$/, "", $0); if ($0 != "MEMCHAT_UPDATE_V1") valid=0; next }
   else if (value !~ /^[0-9a-fA-F]+$/ || length(value) != 64) valid=0
 }
 END {
-  if (NR != 10) valid=0
+  if (NR != 10 + v2) valid=0
   split("version sha256 url file.build-info.json file.config.js file.content.js file.controls.js file.manifest.json file.worker.js",required," ")
   for (i=1;i<=9;i++) if (!seen[required[i]]) valid=0
+  if (v2 && !seen["file.icon.png"]) valid=0
   exit !valid
 }' "$INDEX" || fail 'invalid update index'
 
 get_value() { awk -v wanted="$1" '{ sub(/\r$/, "", $0); if (index($0,"=") && substr($0,1,index($0,"=")-1)==wanted) print substr($0,index($0,"=")+1) }' "$INDEX"; }
+REQUIRED_FILES='build-info.json config.js content.js controls.js manifest.json worker.js'
+if [ -n "$(get_value file.icon.png)" ]; then REQUIRED_FILES="$REQUIRED_FILES icon.png"; fi
 VERSION=$(get_value version)
 EXPECTED_URL="https://github.com/xtalia/memchat-dist/releases/download/chrome-v$VERSION/memchat-chrome.zip"
 [ "$(get_value url)" = "$EXPECTED_URL" ] || fail 'update URL does not match the publisher release URL'
@@ -153,7 +156,7 @@ if [ -e "$TARGET" ]; then
     # Compare exit codes: 1 means current is newer; 2 means the release is newer.
     if [ "$cmp" -eq 0 ]; then
         match=1
-        for name in build-info.json config.js content.js controls.js manifest.json worker.js; do
+        for name in $REQUIRED_FILES; do
             expected=$(get_value "file.$name" | tr 'A-F' 'a-f')
             if [ ! -f "$TARGET/$name" ] || [ "$(sha_file "$TARGET/$name")" != "$expected" ]; then match=0; fi
         done
@@ -171,18 +174,18 @@ BEGIN {valid=1}
   name=$0
   if (name ~ /\\/ || name ~ /^\// || name ~ /(^|\/)\.\.(\/|$)/ || name ~ /(^|\/)\.($|\/)/) valid=0
   if (name == "chrome-extension/") {if (seen[name]++) valid=0; next}
-  if (name ~ /^chrome-extension\/(build-info\.json|config\.js|content\.js|controls\.js|manifest\.json|worker\.js)$/ || name ~ /^(Update-Memchat\.ps1|Update-Memchat\.cmd|update-memchat\.sh|Update-Memchat\.command|README\.md)$/) {if (seen[name]++) valid=0; next}
+  if (name ~ /^chrome-extension\/(build-info\.json|config\.js|content\.js|controls\.js|manifest\.json|worker\.js|icon\.png)$/ || name ~ /^(Update-Memchat\.ps1|Update-Memchat\.cmd|update-memchat\.sh|Update-Memchat\.command|README\.md)$/) {if (seen[name]++) valid=0; next}
   valid=0
 }
 END {exit !valid}' "$LIST" || fail 'ZIP contains an unknown, duplicate, or unsafe path'
-for name in build-info.json config.js content.js controls.js manifest.json worker.js; do
+for name in $REQUIRED_FILES; do
     grep -Fqx "chrome-extension/$name" "$LIST" || fail "ZIP is missing chrome-extension/$name"
 done
 
 EXT="$WORK/chrome-extension"
 mkdir "$EXT" || fail 'cannot create extraction staging directory'
 TOTAL=0
-for name in build-info.json config.js content.js controls.js manifest.json worker.js; do
+for name in $REQUIRED_FILES; do
     remaining=$((MAX_EXTRACTED - TOTAL))
     limit=$((remaining + 1))
     set +e

@@ -1,79 +1,29 @@
-# Memchat: background CSRF and top-layer window — Implementation Plan
+# Memchat Chrome 8.9.0.2: задачи и приёмка
 
-**Goal:** Deliver a committed and published Chrome MV3 extension release that retrieves Panel CSRF silently using the existing browser session and keeps Memchat above page content without losing its state.
+## Область релиза
 
-**Architecture:** Keep the generated production userscript 8.8.0-beta byte-for-byte unchanged. Add extension-only runtime adapters after the existing core and a dedicated validated CSRF request in the service worker. Use a transparent, nonmodal manual-popover host in the browser top layer for the existing windows; retain their elements and display-based toolbar toggle.
+Extension-only изменения на базе source `17ee4c0`. Generated `js/memchat.user.js`, DEV и исходные core-модули не меняются. Рабочая копия пользователя `E:/gitreps/hatiko` с посторонним WIP не затрагивается.
 
-**Tech stack:** Chrome MV3, existing JavaScript core and Node test runner/jsdom, Python deterministic ZIP builder, installed Playwright/Chromium, GitHub git/gh.
+## Задачи
 
-## Verified context
+1. **Единый фоновый опрос.** Перенести таймер из content tabs в service worker / chrome.alarms. Одна конфигурация на профиль; приватное session-хранилище Bearer; один flight для параллельных вызовов; отсутствие произвольного лимита общего количества заказов. Снять искусственные 500 мс именно для собственных фоновых запросов, сохранить cap=2 и серверные квоты/429/retry. Открытие вкладки не сбрасывает alarm и не перезаписывает настройки. Изменение/остановка сериализованы; устаревшая работа отменяется. Результат/звук получает одна подходящая вкладка с текущим ключом/ревизией.
+2. **Товары и штрихкоды.** «Получить товары» создаёт полный снимок выбранных заказов покупателей, агрегирует количества и строковые штрихкоды без потери начальных нулей. Внутренние заказы необязательны для основного списка. При настроенных внутренних заказах тот же снимок поддерживает «Что добавлено» — превышение их количества над заказами покупателей. Эта кнопка не обращается к сети. После изменения аккаунта/фильтров старый снимок не выдаётся за актуальный. Ошибки/неполные позиции не превращаются в пустой успешный результат.
+3. **Иконка.** Локальная PNG 128×128, manifest.icons и action.default_icon, без скачиваемого исполняемого кода. Воспроизводимый Pillow-генератор; сборка использует готовую PNG и не требует Pillow.
+4. **Соединения.** Раздельные bearer/panel индикаторы 🟢/🔴/🟡; фактическое подтверждение, ошибки авторизации и offline не смешиваются. Подсказки объясняют, что отображается последняя проверка. Нажатие повторяет проверку.
+5. **Проверка.** RED/GREEN regressions, полный Node suite, offline PowerShell/Bash updater suites, реальный packaged Chromium: два клиента/один запрос, pagination, товары/штрихкоды/added-only, неполные позиции, отсутствие страниц и настоящий alarm; main UI/top-layer/transport smoke; реальная кнопка Reload при обновлении предыдущей версии. Независимое read-only ревью перед коммитом.
+6. **Коммит и production GitHub release.** Source commit в main, отдельный dist artifact commit/tag `chrome-v8.9.0.2`, неизменяемый release ZIP. Только после доступности ZIP — descriptor commit. Read-back точных remote refs, файлов, release ZIP и SHA-256; оба существующих userscript должны остаться без изменений.
 
-- Source: E:/gitreps/hatiko. Dirty checkout main at 783d854 has unrelated debug-window/internal-order work. Do not alter or publish those files.
-- Fetched origin/main a8eaa8412e4810884fc07f7f5144cc4874289ede has the same source tree as local HEAD but different history. Use an isolated worktree based on origin/main, not a reset/merge of the dirty checkout.
-- Distribution: E:/gitreps/memchat-dist. Local checkout is stale; fetched origin/main is 7ac6bdd. Use a separate distribution worktree. Preserve both existing userscripts.
-- Current extension: Chrome 8.8.0.1 / 8.8.0-beta-chrome.1. Wrapper-only next release: 8.8.0.2 / 8.8.0-beta-chrome.2.
-- Existing CSRF path goes through generic panelRequest which expects API-like responses; failure may open a tab. Core caches CSRF in page localStorage separately per origin. Replace that path for the extension only.
-- Native toolbar toggle and single reset context item must survive unchanged.
-- gh authenticated as xtalia. Playwright and bundled Chromium are installed. No package installation required.
+## Совместимость обновлятора
 
-## Documentation-grounded constraints
+PNG — седьмой файл: новый **MEMCHAT_UPDATE_V2**. Новые launchers принимают V1 (6 файлов) и V2 (7 файлов) с точным allowlist и хешами. Старый V1 updater новый формат безопасно отклоняет. Для перехода один раз скачать новый ZIP, заменить файлы обновлятора рядом с прежней папкой расширения и запустить их. Путь, ID, localStorage и история сохраняются; не удалять/переустанавливать расширение.
 
-- https://developer.chrome.com/docs/extensions/develop/concepts/network-requests — cross-origin fetch belongs in extension worker with host permissions, not page/content fetch.
-- https://developer.mozilla.org/en-US/docs/Web/API/Popover_API/Using — manual popovers are nonmodal, not light-dismissed, and enter top layer.
-- https://developer.mozilla.org/en-US/docs/Glossary/Top_layer — z-index cannot beat browser top layer. Later top-layer entries may cover earlier entries; modal dialogs make outside content inert.
-- Existing valid same-profile Panel session is required; obtaining CSRF cannot bypass expired login, CAPTCHA, 2FA, browser policy, or server restrictions. No password collection, hidden login automation, or business writes.
-- Above page elements means inside the tab, not above Chrome UI or other OS applications.
+## Честные границы
 
-## Task 1: Isolate release
+- Production-канал здесь — существующий GitHub ZIP/updater. Публикация в Chrome Web Store не выполняется и не подразумевается.
+- Проверка авторизованных ответов — явно синтетические HTTP fixtures в настоящем расширении/Chromium. Live Hatiko — публичный read-only; live Panel — корректный отказ без сессии. Реальные бизнес-документы не изменяются.
+- Фоновый polling работает при запущенном Chrome после первичной настройки; session-конфигурация не переживает полное закрытие браузера. Звук/тосты требуют подходящей живой вкладки и разрешённого autoplay; ОС может задерживать alarm во сне.
+- Bash запускается на Windows через Git Bash; это не native macOS проверка. Windows symlink regression может быть пропущен при отсутствии привилегии создания symlink.
 
-1. Create source release worktree/branch from fetched origin/main and distribution worktree/branch from fetched dist origin/main.
-2. Reuse existing node_modules read-only via NODE_PATH; set TEMP/TMP to Hermes scratch.
-3. Record baseline npm test and production/distribution userscript hashes.
+## Артефакты доказательств
 
-## Task 2: Background CSRF (RED → GREEN)
-
-Files: js/memchat/extension/worker.js; new js/memchat/extension/runtime.js; tests/chrome-extension-transport.test.js; new tests/chrome-extension-runtime.test.js.
-
-1. Add one failing test for a dedicated memchat:panel-csrf message from a trusted top-frame content sender.
-2. Implement fixed GET https://panel.hatiko.ru/search, HTML Accept, credentials:include, no X-Requested-With, no page opening. Bound fetch/body by timeout, use existing DNR readiness.
-3. Reject login redirects/forms, failed status, invalid or missing token. Parse meta attributes in either order; do not mistake login form _token for authenticated CSRF.
-4. Cache only in worker memory, TTL 12 minutes, share concurrent refreshes across tabs. A forced refresh invalidates stale cache; failures clear cache and release in-flight state.
-5. Add tests for concurrency, forced refresh/419-retry integration, stale/failed login, malformed sender, timeout, no logs/secrets/localStorage.
-6. Runtime adapts ensurePanelCsrf and refreshPanelCsrf to the private worker message; disable automatic Panel tab opening. Remove only legacy panelCsrf key for current site; never persist new token to site storage.
-7. Existing Panel search/bonuses retry once after 401/403/419 using forced worker refresh. No generic transport URL expansion or additional permissions.
-
-## Task 3: Top layer (RED → GREEN)
-
-Files: new extension/top-layer.js, tests/chrome-extension-top-layer.test.js, extension/top-layer-smoke.cjs, extension/smoke.cjs.
-
-1. Add a failing DOM test for an owned manual-popover host receiving the actual main and floating window nodes.
-2. Create transparent full-viewport host with pointer-events:none and direct window children pointer-events:auto; reset default popover margin/border/padding. Keep existing coordinates, dimensions, drag/resize, native controls and close handlers.
-3. Move only known Memchat roots into host; use one observer and coalesced refresh, no intervals. Exclude inline MoySklad quick panel.
-4. Re-promote on subsequent site popover/dialog/fullscreen activity without self-trigger loops. Place host within active modal dialog/fullscreen subtree as necessary to avoid inertness. Restore owned focus on host changes. Return to body after dialog closes.
-5. Test no duplicates, hidden main state, floating/settings windows, unrelated nodes untouched, host absence on unsupported API fallback.
-6. Real headless browser: high-z-index full-screen overlay, later site popover, modal dialog/backdrop (including input click/focus), close/reopen, settings, reset, click-through outside windows, drag/resize, draft/history/tab persistence. Screenshot and inspect.
-
-## Task 4: Package and verify
-
-Files: extension/build.py, extension/README.md, tests/chrome-extension-build.test.js, extension/smoke.cjs.
-
-1. Bump wrapper revision to 2 and include extension runtime after unchanged production core. Update exact version test expectations and architecture docs.
-2. node --check changed/generated JS; node --test tests/chrome-extension-*.test.js; npm test; python extension/build.py; node extension/smoke.cjs.
-3. Test authenticated behavior using explicit synthetic HTTP fixtures in isolated browser, clearly labelled as fixtures; perform read-only live Hatiko and unauthenticated Panel checks separately. Do not imply authenticated live Panel E2E without an actual user session.
-4. Verify deterministic ZIP, exact entry set, no new privileges, source userscript hash unchanged.
-
-## Task 5: Review, commit, release
-
-1. Review full diff, security/error paths, tests; stage only task paths, commit source branch and fast-forward origin/main if unchanged. No force-push.
-2. Copy exact package/ZIP/installation docs and this plan into isolated dist worktree. Preserve .gitattributes byte rules and both userscript blobs.
-3. Commit dist artifacts, push; create GitHub release tagged chrome-v8.8.0.2 with ZIP and accurate notes. This is a GitHub package release, NOT Chrome Web Store publication; Unlisted distribution remains a separate publishing step.
-4. Read exact remote refs and artifacts back, compare all ZIP entries and artifact bytes/SHA-256, download release asset and compare. Confirm old userscripts unchanged and source user WIP untouched.
-5. Report release URL, commit handles, tests and any genuine verification limit.
-
-## Acceptance criteria
-
-- Valid existing session: no Panel tab/manual token copying required; tokens not persisted in site storage; concurrency shared and auth retry bounded.
-- Expired login: honest error, no popup storm and no fabricated token.
-- Main chat and settings/pickers appear over normal overlays and later browser top-layer UI, remain interactive in modal case, without losing drafts/history.
-- Existing action/context menu contract preserved.
-- Source commit and downloadable verified GitHub release exist. Chrome Web Store publication not claimed.
+`extension/dist/orders-service-smoke-report.json`, `smoke-report.json`, `updater-smoke-report.json`, `orders-service-smoke.png`; полные журналы Node/Python тестов — в Hermes scratch. При публикации основной итог проверок указывается в release notes.

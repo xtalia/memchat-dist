@@ -82,8 +82,10 @@ function Parse-UpdateIndex([string]$Text) {
     $lines = $Text -split "`n"
     if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines = $lines[0..($lines.Count - 2)] }
     if ($lines.Count -gt 0) { $lines[0] = $lines[0].TrimEnd("`r") }
-    if ($lines.Count -ne 10) { Stop-Updater 'The update index has an invalid number of lines.' }
-    if ($lines[0] -cne 'MEMCHAT_UPDATE_V1') { Stop-Updater 'The update index header is invalid.' }
+    if ($lines.Count -lt 1 -or $lines[0] -cnotmatch '^MEMCHAT_UPDATE_V[12]$') { Stop-Updater 'The update index header is invalid.' }
+    $script:RequiredFiles = @('build-info.json', 'config.js', 'content.js', 'controls.js', 'manifest.json', 'worker.js')
+    if ($lines[0] -ceq 'MEMCHAT_UPDATE_V2') { $script:RequiredFiles += 'icon.png' }
+    if ($lines.Count -ne (4 + $script:RequiredFiles.Count)) { Stop-Updater 'The update index has an invalid number of lines.' }
     $values = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
     for ($i = 1; $i -lt $lines.Count; $i++) {
         $line = $lines[$i].TrimEnd("`r")

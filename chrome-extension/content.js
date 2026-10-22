@@ -6749,6 +6749,280 @@ ensurePanelCsrf = (onSuccess, onError, force = false) => extensionPanelCsrf(onSu
 // Missing/expired auth is reported by the existing core; no surprise tabs/popups.
 openPanelInBackground = () => {};
 
+// Extension-only notifier: content tabs configure/render; the MV3 worker polls.
+let extensionOrderRevision;
+let extensionOrderToken = '';
+let extensionOrderEdit = false;
+let extensionOrderSync = Promise.resolve();
+let extensionOrderLastShown = '';
+const extensionConnectionState = { panel: 'unknown', bearer: 'unknown' };
+function extensionMessage(message) {
+    return new Promise((resolve, reject) => {
+        try { chrome.runtime.sendMessage(message, result => {
+            if (chrome.runtime.lastError) reject(Error('Расширение обновлено. Перезагрузите вкладку.'));
+            else if (!result?.ok) {
+                if (result?.conflict) extensionOrderRevision = result.revision;
+                reject(Error(result?.error || 'Расширение недоступно'));
+            } else resolve(result);
+        }); } catch { reject(Error('Расширение недоступно. Перезагрузите вкладку.')); }
+    });
+}
+function extensionRenderConnections() {
+    const root = document.getElementById('memchatConnectionStatus');
+    if (!root) return;
+    extensionConnectionState.bearer = hackerApiValidated && hackerBearerEnabled ? 'ok' : 'error';
+    for (const name of ['bearer', 'panel']) {
+        const el = root.querySelector(`[data-connection="${name}"]`);
+        const state = navigator.onLine === false ? 'unknown' : extensionConnectionState[name];
+        const text = `${state === 'ok' ? '🟢' : state === 'error' ? '🔴' : '🟡'} ${name}`;
+        if (el.textContent !== text) el.textContent = text;
+        el.dataset.state = state;
+        el.title = name === 'panel' ? 'Panel: результат последней проверки сессии. Нажми для обновления.' : 'Bearer: подтверждение ключа МойСклад в этой вкладке.';
+    }
+}
+function extensionAttachConnections() {
+    const main = window.priceCheckContainer;
+    if (!main || document.getElementById('memchatConnectionStatus')) return;
+    const root = document.createElement('div');
+    root.id = 'memchatConnectionStatus';
+    root.style.cssText = 'display:flex;gap:10px;align-items:center;font:11px/1.4 Segoe UI,sans-serif;padding:3px 0;color:#475569;flex-shrink:0;';
+    for (const name of ['bearer', 'panel']) {
+        const el = document.createElement('button');
+        el.type = 'button'; el.dataset.connection = name;
+        el.style.cssText = 'border:0;background:transparent;padding:0;cursor:pointer;font:inherit;color:inherit;';
+        el.addEventListener('click', () => {
+            if (name === 'bearer') hackerValidateApiKey();
+            else extensionCheckPanel(true);
+        });
+        root.appendChild(el);
+    }
+    main.insertBefore(root, main.children[1] || null);
+    extensionRenderConnections();
+    extensionCheckPanel(false);
+}
+function extensionCheckPanel(force) {
+    extensionConnectionState.panel = 'unknown'; extensionRenderConnections();
+    extensionMessage({ type: 'memchat:panel-csrf', force }).then(() => {
+        extensionConnectionState.panel = 'ok'; extensionRenderConnections();
+    }, () => { extensionConnectionState.panel = 'error'; extensionRenderConnections(); });
+}
+const extensionOriginalEnsurePanel = ensurePanelCsrf;
+ensurePanelCsrf = (success, failure, force = false) => extensionOriginalEnsurePanel(token => {
+    extensionConnectionState.panel = 'ok'; extensionRenderConnections(); success?.(token);
+}, error => {
+    extensionConnectionState.panel = 'error'; extensionRenderConnections(); failure?.(error);
+}, force);
+refreshPanelCsrf = (success, failure) => ensurePanelCsrf(success, failure, true);
+const extensionOriginalNotifierBuild = hackerBuildNotifierTab;
+hackerBuildNotifierTab = (...args) => {
+    const root = extensionOriginalNotifierBuild(...args);
+    const status = root.querySelector('#hackerNotifierStatus');
+    status.textContent = hackerNotifierSettings.enabled ? 'Опрос в фоне расширения · единый для всех вкладок' : 'Оповещатель выключен';
+    return root;
+};
+const extensionOriginalCreate = createPriceCheckWindow;
+createPriceCheckWindow = function (...args) { const result = extensionOriginalCreate(...args); extensionAttachConnections(); return result; };
+const extensionOriginalAccess = hackerSyncAccessUi;
+hackerSyncAccessUi = function (...args) { const result = extensionOriginalAccess(...args); extensionRenderConnections(); return result; };
+window.addEventListener('offline', extensionRenderConnections);
+window.addEventListener('online', () => { extensionConnectionState.panel = 'unknown'; extensionRenderConnections(); });
+
+hackerNotifierEnsureIndicator = () => {
+    let indicator = document.getElementById('hackerNotifierIndicator');
+    const enabled = hackerApiValidated && hackerNotifierSettings.enabled && hackerNotifierSettings.organizationHrefs.length && hackerNotifierSettings.statusHrefs.length;
+    if (!enabled) { indicator?.remove(); return; }
+    if (!indicator) {
+        indicator = document.createElement('span'); indicator.id = 'hackerNotifierIndicator'; indicator.textContent = '🐻';
+        indicator.title = 'Опрос заказов выполняется в фоне расширения';
+        indicator.style.cssText = 'position:fixed;right:14px;bottom:12px;opacity:.35;pointer-events:none;'; document.body.appendChild(indicator);
+    }
+};
+hackerNotifierStop = () => {
+    extensionOrderToken = '';
+    // This hook is called before a local credential change/failed validation.
+    // Pagehide does not revoke the worker: closing a tab must not stop polling.
+    if (hackerNotifierTimer) clearInterval(hackerNotifierTimer);
+    hackerNotifierTimer = null;
+    const token = hackerBearerToken;
+    if (!token) return Promise.resolve();
+    const pending = extensionOrderSync.then(() => extensionMessage({ type: 'memchat:orders-stop', token }))
+        .then(result => { extensionOrderRevision = result.revision; }, () => {});
+    extensionOrderSync = pending;
+    return pending;
+};
+hackerNotifierStart = () => {
+    if (hackerNotifierTimer) clearInterval(hackerNotifierTimer);
+    hackerNotifierTimer = null;
+    if (!hackerApiValidated || !hackerBearerEnabled || !hackerBearerToken.trim()) return Promise.resolve();
+    const update = extensionOrderEdit; extensionOrderEdit = false;
+    const payload = { type: 'memchat:orders-configure', token: hackerBearerToken, settings: { ...hackerNotifierSettings },
+        organizations: hackerNotifierOrganizations.map(item => ({ href: item.href, name: item.name })), update };
+    const pending = extensionOrderSync.then(() => extensionMessage({ ...payload, revision: extensionOrderRevision }))
+        .then(result => {
+            extensionOrderRevision = result.revision;
+            extensionOrderToken = payload.token;
+            if (result.settings) hackerNotifierSettings = hackerNotifierNormalizeSettings(result.settings);
+            hackerNotifierSaveSettings(); hackerNotifierFillControls(); hackerNotifierEnsureIndicator();
+            hackerNotifierSetStatus('Опрос в фоне расширения · единый для всех вкладок');
+        }).catch(error => { hackerNotifierSetStatus(error.message, 'error'); });
+    extensionOrderSync = pending;
+    return pending;
+};
+const extensionOriginalNotifierRead = hackerNotifierReadControls;
+hackerNotifierReadControls = function (...args) {
+    extensionOrderEdit = true;
+    return extensionOriginalNotifierRead(...args);
+};
+hackerNotifierPoll = async () => {
+    try {
+        await extensionOrderSync;
+        const response = await extensionMessage({ type: 'memchat:orders-poll', token: hackerBearerToken });
+        // Results/toasts are delivered to one tab by the worker, never per caller.
+        const result = response.result;
+        hackerNotifierSetStatus(result.partial ? '⚠ Неполный опрос: ' + result.failed.join(', ')
+            : `Проверено: ${new Date(result.at).toLocaleTimeString()} · заказов: ${result.orders.length}`, result.partial ? 'error' : 'ok');
+        return result.orders;
+    } catch (error) { hackerNotifierSetStatus(error.message, 'error'); return []; }
+};
+chrome.runtime.onMessage.addListener((message, sender, respond) => {
+    if (sender.id !== chrome.runtime.id || sender.tab || (sender.url && sender.url !== chrome.runtime.getURL('worker.js'))) return false;
+    if (message?.type !== 'memchat:orders-result') return false;
+    if (!hackerApiValidated || !hackerBearerEnabled || extensionOrderToken !== hackerBearerToken || message.revision !== extensionOrderRevision) { respond({ ok: false }); return false; }
+    const result = message.result;
+    if (!result || !Array.isArray(result.orders)) return false;
+    if (extensionOrderLastShown !== result.id) {
+        extensionOrderLastShown = result.id;
+        if (message.settings) hackerNotifierSettings = hackerNotifierNormalizeSettings(message.settings);
+        if (result.bearer === 'error') { hackerApiValidated = false; hackerSyncAccessUi(); }
+        result.orders.forEach(hackerNotifierShowToast);
+        if (result.orders.length && hackerNotifierSettings.soundEnabled) hackerNotifierPlayAlarm();
+        hackerNotifierSetStatus(result.partial ? '⚠ Неполный опрос: ' + result.failed.join(', ')
+            : `Проверено: ${new Date(result.at).toLocaleTimeString()} · заказов: ${result.orders.length}`, result.partial ? 'error' : 'ok');
+        hackerNotifierEnsureIndicator();
+    }
+    respond({ ok: true });
+    return false;
+});
+extensionAttachConnections();
+
+// On-demand order products. The second action is a view of the SAME snapshot,
+// not another network run. No business documents are ever written here.
+let extensionProductsSnapshot = null;
+let extensionProductsFlight = null;
+const extensionOriginalAggregate = internalOrderCheckAggregate;
+internalOrderCheckAggregate = rows => {
+    const goods = extensionOriginalAggregate(rows);
+    for (const item of Object.values(goods)) item.barcodes = [];
+    for (const position of rows) {
+        const item = goods[internalOrderCheckPositionKey(position)];
+        const assortment = position?.assortment || position?.product || {};
+        for (const entry of Array.isArray(assortment.barcodes) ? assortment.barcodes : []) {
+            for (const value of Object.values(entry || {})) if (typeof value === 'string' && value && !item.barcodes.includes(value)) item.barcodes.push(value);
+        }
+    }
+    return goods;
+};
+// The core historically treated malformed pages/position refs as empty data.
+// Reject those here so a broken API response cannot become a green comparison.
+internalOrderCheckFetchAllPages = async function (path, rows = [], visited = new Set(), generation = msApiGeneration) {
+    const collected = [...rows];
+    while (path) {
+        if (generation !== msApiGeneration) throw Error('Аккаунт изменён. Получите товары заново.');
+        const normalized = hackerApiPath(path);
+        if (!normalized || visited.has(normalized)) throw Error('Циклическая пагинация МойСклад');
+        visited.add(normalized);
+        const page = await msApiP('GET', normalized);
+        if (generation !== msApiGeneration) throw Error('Аккаунт изменён. Получите товары заново.');
+        if (!Array.isArray(page?.rows)) throw Error('Неполный ответ списка товаров');
+        collected.push(...page.rows);
+        path = page.meta?.nextHref;
+        if (path && !page.rows.length) throw Error('Пустая промежуточная страница товаров');
+        if (!path && Number.isFinite(page.meta?.size) && collected.length < page.meta.size) throw Error('МойСклад вернул неполный список товаров');
+    }
+    return collected;
+};
+function extensionProductSettingsKey() { return JSON.stringify(internalOrderCheckSettings); }
+function extensionProductsStatus(text, error = false) {
+    const el = document.getElementById('hackerInternalOrderCheckStatus');
+    if (el) { el.textContent = text; el.style.color = error ? '#b91c1c' : '#475569'; }
+}
+function extensionShowProducts(items, title, at) {
+    // Reuse core's movable result window, then replace its comparison-only body.
+    internalOrderCheckShowResult({ added: [], missed: [] });
+    const win = document.getElementById('hackerInternalOrderCheckResult');
+    win.querySelector('.mc-float-title').textContent = title;
+    const body = win.querySelector('.mc-float-body');
+    body.replaceChildren();
+    const timestamp = document.createElement('div');
+    timestamp.style.cssText = 'font-size:11px;color:#64748b;margin-bottom:8px;';
+    timestamp.textContent = `Снимок ${new Date(at).toLocaleString()} · позиций: ${items.length}`;
+    body.appendChild(timestamp);
+    if (!items.length) { const empty = document.createElement('div'); empty.textContent = 'Нет позиций'; body.appendChild(empty); }
+    for (const item of items) {
+        const row = document.createElement('div');
+        row.style.cssText = 'padding:8px;border:1px solid #e2e8f0;border-radius:7px;margin-bottom:6px;';
+        const label = document.createElement('div'); label.textContent = `${item.name} × ${item.quantity}`;
+        const codes = document.createElement('div'); codes.style.cssText = 'font:12px/1.6 Consolas,monospace;white-space:pre-wrap;user-select:text;';
+        codes.textContent = item.barcodes?.length ? item.barcodes.join('\n') : 'Штрихкод не указан';
+        row.append(label, codes); body.appendChild(row);
+    }
+}
+function extensionShowAddedProducts() {
+    const snapshot = extensionProductsSnapshot;
+    if (!snapshot || snapshot.generation !== msApiGeneration || snapshot.settingsKey !== extensionProductSettingsKey()) {
+        document.getElementById('hackerInternalOrderCheckResult')?.remove();
+        extensionProductsStatus('Сначала получите актуальный список товаров.', true); return;
+    }
+    if (!snapshot.internal) { extensionProductsStatus('Для просмотра добавленного настройте внутренние заказы и получите товары заново.', true); return; }
+    const added = internalOrderCheckCompareMaps(snapshot.customer, snapshot.internal).added.map(item => ({ ...item,
+        barcodes: snapshot.internal[item.key]?.barcodes || snapshot.customer[item.key]?.barcodes || [] }));
+    extensionShowProducts(added, '➕ Добавлено во внутренних заказах', snapshot.at);
+}
+function extensionLoadOrderProducts() {
+    if (extensionProductsFlight) return extensionProductsFlight;
+    const generation = msApiGeneration;
+    internalOrderCheckReadControls();
+    const settings = JSON.parse(JSON.stringify(internalOrderCheckSettings));
+    const settingsKey = extensionProductSettingsKey();
+    const button = document.getElementById('hackerInternalOrderCompare');
+    if (button) button.disabled = true;
+    extensionProductsSnapshot = null;
+    document.getElementById('hackerInternalOrderCheckResult')?.remove();
+    extensionProductsStatus('Получаю товары и штрихкоды…');
+    extensionProductsFlight = (async () => {
+        const orders = await internalOrderCheckFetchDocuments('customerorder', settings.customerOrganizationHref, settings.customerWarehouseHref, settings.customerStatusHrefs);
+        const customer = await internalOrderCheckCollectGoods('customerorder', orders);
+        let internal = null;
+        if (settings.internalOrganizationHref && settings.internalWarehouseHref && settings.internalStatusHrefs.length) {
+            const documents = await internalOrderCheckFetchDocuments('internalorder', settings.internalOrganizationHref, settings.internalWarehouseHref, settings.internalStatusHrefs);
+            internal = await internalOrderCheckCollectGoods('internalorder', documents);
+        }
+        if (generation !== msApiGeneration || settingsKey !== extensionProductSettingsKey()) throw Error('Настройки изменились. Получите товары заново.');
+        extensionProductsSnapshot = { generation, settingsKey, customer, internal, at: Date.now() };
+        extensionShowProducts(Object.values(customer).sort((a, b) => a.name.localeCompare(b.name, 'ru')), '📦 Товары из заказов', extensionProductsSnapshot.at);
+        extensionProductsStatus(`Готово · заказов: ${orders.length} · товаров: ${Object.keys(customer).length}`);
+        return extensionProductsSnapshot;
+    })().catch(error => { extensionProductsStatus(error.message || 'Не удалось получить товары', true); return null; })
+        .finally(() => { extensionProductsFlight = null; if (button) button.disabled = false; });
+    return extensionProductsFlight;
+}
+hackerBuildInternalOrderCheckTab = () => {
+    internalOrderCheckLoadSettings();
+    const wrap = hackerEl('div'); wrap.id = 'hackerTabInternalOrderCheck';
+    wrap.appendChild(hackerEl('div', 'font-size:11px;color:#64748b;line-height:1.4;margin-bottom:8px;',
+        'Получить товары — список и штрихкоды из заказов покупателей. «Что добавлено» — превышение количества во внутренних заказах по тому же снимку, без повторных запросов.'));
+    const buttons = hackerEl('div', 'display:flex;gap:4px;flex-wrap:wrap;');
+    const settings = hackerBtn('hackerInternalOrderOpenSettings', '⚙️ Настройки', HACKER_MINI_BTN_CSS);
+    const load = hackerBtn('hackerInternalOrderCompare', '📦 Получить товары', HACKER_BTN_CSS + 'background:#4f46e5;');
+    const added = hackerBtn('hackerInternalOrderShowAdded', '➕ Что добавлено', HACKER_MINI_BTN_CSS);
+    settings.addEventListener('click', () => openSettingsWindow('internalOrderCheck'));
+    load.addEventListener('click', () => { extensionLoadOrderProducts(); });
+    added.addEventListener('click', extensionShowAddedProducts);
+    buttons.append(settings, load, added); wrap.appendChild(buttons);
+    const status = hackerEl('div', 'min-height:16px;margin-top:6px;font-size:10.5px;', ''); status.id = 'hackerInternalOrderCheckStatus'; wrap.appendChild(status);
+    return wrap;
+};
+
 /* Extension-only Memchat UI promotion. Include after the production userscript body. */
 (() => {
     'use strict';

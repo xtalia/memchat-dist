@@ -153,7 +153,7 @@ function msPump() {
             await msPersist();
         } else {
             if (Date.now() >= msBudgetUntil) msRemaining = null;
-            msNextAt = Math.max(msNextAt, Date.now() + 500 * task.weight / 4);
+            msNextAt = Math.max(msNextAt, Date.now() + (task.unpaced ? 0 : 500 * task.weight / 4));
             if (msRemaining !== null) {
                 msRemaining = Math.max(0, msRemaining - task.weight);
                 if (msRemaining < 5) msBlockedUntil = Math.max(msBlockedUntil, msBudgetUntil);
@@ -170,11 +170,11 @@ function msPump() {
         msPump();
     });
 }
-async function msAcquire(signal, weight, checkCurrent) {
+async function msAcquire(signal, weight, checkCurrent, unpaced = false) {
     await msReady;
     if (msStorageFailed) throw new Error('Quota state unavailable');
     return new Promise((resolve, reject) => {
-        const task = { signal, weight, checkCurrent, resolve, reject, cancel: null };
+        const task = { signal, weight, checkCurrent, unpaced, resolve, reject, cancel: null };
         task.cancel = () => {
             const index = msQueue.indexOf(task);
             if (index >= 0) msQueue.splice(index, 1);
@@ -188,7 +188,7 @@ async function msAcquire(signal, weight, checkCurrent) {
     });
 }
 
-async function performRequest(message, sender) {
+async function performRequest(message, sender, backgroundSignal) {
     const request = message.request;
     const url = allowedUrl(request?.url);
     const method = String(request.method || 'GET').toUpperCase();
@@ -207,6 +207,9 @@ async function performRequest(message, sender) {
     if (pendingRequests.has(key)) throw new Error('Duplicate request');
     const entry = { controller: new AbortController(), event: '' };
     pendingRequests.set(key, entry);
+    const cancelBackground = () => { entry.event = 'abort'; entry.controller.abort(); };
+    backgroundSignal?.addEventListener('abort', cancelBackground, { once: true });
+    if (backgroundSignal?.aborted) cancelBackground();
     const timeout = Math.min(30000, Math.max(1, Number(request.timeout) || 30000));
     let timer;
     let release;
@@ -228,7 +231,7 @@ async function performRequest(message, sender) {
         if (ruleFailure) throw new Error('Network rules unavailable');
         for (let attempt = 0; ; attempt++) {
             if (entry.event) return { event: entry.event };
-            if (isMsJsonApi(url)) release = await msAcquire(entry.controller.signal, msRequestWeight(url, method), checkCurrent);
+            if (isMsJsonApi(url)) release = await msAcquire(entry.controller.signal, msRequestWeight(url, method), checkCurrent, sender.tab.id === -1);
             if (entry.event) return { event: entry.event };
             const networkTime = Math.min(timeout, release ? release.deadline - Date.now() : timeout);
             if (networkTime <= 0) return { event: 'timeout' };
@@ -265,6 +268,7 @@ async function performRequest(message, sender) {
     } finally {
         clearTimeout(timer);
         await release?.();
+        backgroundSignal?.removeEventListener('abort', cancelBackground);
         pendingRequests.delete(key);
     }
 }
@@ -348,7 +352,185 @@ function getPanelSession(force) {
     return startPanelSessionFlight(force);
 }
 
+// Shared order polling is independent of the lifetime/number of content tabs.
+// Session storage is extension-private; bearer never enters a broadcast or logs.
+const ORDER_SESSION_KEY = 'memchatOrderService_v1';
+let orderConfig = null;
+let orderSubscribers = new Set();
+let orderRevision = 0;
+let orderFlight = null;
+let orderController = null;
+let orderLastResult = null;
+let orderConfigChain = Promise.resolve();
+function orderMutate(callback) {
+    const next = orderConfigChain.then(callback);
+    orderConfigChain = next.catch(() => {});
+    return next;
+}
+const orderReady = (async () => {
+    try {
+        const saved = (await chrome.storage.session.get(ORDER_SESSION_KEY))[ORDER_SESSION_KEY];
+        if (saved) { orderConfig = saved.config; orderRevision = saved.revision || 0; orderSubscribers = new Set(saved.subscribers || []); }
+    } catch { /* Configure must successfully persist before enabling polling. */ }
+})();
+function orderPublicConfig() {
+    return { ok: true, settings: orderConfig?.settings, revision: orderRevision };
+}
+function orderReference(value, kind) {
+    return typeof value === 'string' && new RegExp('^https://api\\.moysklad\\.ru/api/remap/1\\.2/entity/' + kind + '/[A-Za-z0-9-]+$').test(value);
+}
+function orderSettings(raw) {
+    const refs = (values, kind) => {
+        if (!Array.isArray(values) || !values.every(value => orderReference(value, kind))) throw Error('Invalid references');
+        return [...new Set(values)];
+    };
+    return { enabled: raw?.enabled !== false, soundEnabled: raw?.soundEnabled !== false,
+        intervalMinutes: Math.min(1440, Math.max(1, Math.round(Number(raw?.intervalMinutes) || 1))),
+        toastDurationMinutes: Math.min(1440, Math.max(0, Math.round(Number(raw?.toastDurationMinutes) || 0))),
+        organizationHrefs: refs(raw?.organizationHrefs, 'organization'),
+        statusHrefs: refs(raw?.statusHrefs, 'customerorder/metadata/states') };
+}
+async function orderSetAlarm() {
+    if (!chrome.alarms) return;
+    if (orderConfig?.settings.enabled && orderConfig.settings.organizationHrefs.length && orderConfig.settings.statusHrefs.length) {
+        await chrome.alarms.create('memchat-orders', { periodInMinutes: orderConfig.settings.intervalMinutes });
+    } else await chrome.alarms.clear('memchat-orders');
+}
+async function configureOrders(message, sender) {
+    await orderReady;
+    if (typeof message.token !== 'string' || !message.token.trim() || message.token.length > 4096) throw Error('Invalid token');
+    const settings = orderSettings(message.settings);
+    const unchanged = orderConfig?.token === message.token && JSON.stringify(orderConfig.settings) === JSON.stringify(settings);
+    if (orderConfig && (message.update !== true || unchanged)) {
+        if (orderConfig.token !== message.token) return { ok: false, revision: orderRevision, error: 'Другой Bearer в фоне. Сохраните настройки явно для смены аккаунта.' };
+        orderSubscribers.add(sender.tab.id);
+        await chrome.storage.session.set({ [ORDER_SESSION_KEY]: { config: orderConfig, revision: orderRevision, subscribers: [...orderSubscribers] } });
+        if (chrome.alarms?.get && !(await chrome.alarms.get('memchat-orders'))) await orderSetAlarm();
+        return orderPublicConfig();
+    }
+    if (orderConfig && message.revision !== orderRevision) return { ...orderPublicConfig(), ok: false, conflict: true, error: 'Настройки изменены в другой вкладке. Повторите изменение.' };
+    const subscribers = orderConfig?.token === message.token ? new Set(orderSubscribers) : new Set();
+    subscribers.add(sender.tab.id);
+    const config = { token: message.token, settings, organizations: (Array.isArray(message.organizations) ? message.organizations : [])
+        .filter(item => settings.organizationHrefs.includes(item?.href)).map(item => ({ href: item.href, name: String(item.name || '').slice(0, 300) })) };
+    await chrome.storage.session.set({ [ORDER_SESSION_KEY]: { config, revision: orderRevision + 1, subscribers: [...subscribers] } });
+    orderController?.abort();
+    orderConfig = config; orderSubscribers = subscribers; orderRevision++; orderLastResult = null;
+    await orderSetAlarm();
+    return orderPublicConfig();
+}
+async function orderGet(path, config, controller) {
+    const response = await performRequest({ id: 'background-orders', request: {
+        url: 'https://api.moysklad.ru/api/remap/1.2' + path, method: 'GET',
+        headers: { Authorization: 'Bearer ' + config.token, Accept: 'application/json' },
+        anonymous: true, backgroundOrder: true
+    } }, { tab: { id: -1 }, frameId: 0 }, controller.signal);
+    if (controller.signal.aborted || config !== orderConfig) throw Error('Cancelled');
+    if (response.event !== 'load') throw Error('Ошибка соединения с МойСклад');
+    const status = response.response.status;
+    if (status < 200 || status >= 300) { const error = Error('МойСклад: HTTP ' + status); error.status = status; throw error; }
+    let data;
+    try { data = JSON.parse(response.response.responseText); } catch { throw Error('Некорректный ответ МойСклад'); }
+    if (!Array.isArray(data?.rows)) throw Error('Неполный ответ списка заказов');
+    return data;
+}
+async function deliverOrderResult(result, config, controller, revision) {
+    if (!chrome.tabs?.query) return;
+    const tabs = await chrome.tabs.query({});
+    if (config !== orderConfig || controller.signal.aborted) return;
+    const candidates = tabs.filter(tab => orderSubscribers.has(tab.id) && trustedContentSender({ id: chrome.runtime.id, tab, frameId: 0, url: tab.url }));
+    candidates.sort((a, b) => Number(!!b.active) - Number(!!a.active));
+    for (const tab of candidates) {
+            if (config !== orderConfig || controller.signal.aborted) return;
+            try {
+            const ack = await chrome.tabs.sendMessage(tab.id, { type: 'memchat:orders-result', result, revision, settings: config.settings }, { frameId: 0 });
+            if (ack?.ok) break;
+        } catch { /* Try another live content world, not every tab. */ }
+    }
+}
+async function pollOrders() {
+    await orderReady;
+    await orderConfigChain;
+    if (orderFlight) return orderFlight;
+    const config = orderConfig;
+    if (!config?.settings.enabled || !config.settings.organizationHrefs.length || !config.settings.statusHrefs.length) return { ok: false, error: 'Оповещатель выключен или не настроен' };
+    const controller = new AbortController();
+        const revision = orderRevision;
+        orderController = controller;
+    orderFlight = (async () => {
+        const found = new Map(), failed = [];
+        let authFailed = false;
+        for (const href of config.settings.organizationHrefs) {
+            const label = config.organizations.find(item => item.href === href)?.name || 'Организация недоступна';
+            try {
+                const rows = new Map();
+                let offset = 0;
+                for (;;) {
+                    const data = await orderGet('/entity/customerorder?filter=' + encodeURIComponent('organization=' + href)
+                        + '&expand=state,organization&order=moment,desc&limit=100&offset=' + offset, config, controller);
+                    const previous = rows.size;
+                    for (const row of data.rows) {
+                        if (!row?.id) throw Error('Заказ без идентификатора');
+                        rows.set(row.id, row);
+                    }
+                    offset += data.rows.length;
+                    const more = !!data.meta?.nextHref || (Number.isFinite(data.meta?.size) ? offset < data.meta.size : data.rows.length >= 100);
+                    if (!more) break;
+                    if (!data.rows.length || rows.size === previous) throw Error('Пагинация заказов не продвигается');
+                }
+                for (const row of rows.values()) if (config.settings.statusHrefs.includes(row.state?.meta?.href)) {
+                    found.set(row.id, { id: row.id, name: row.name || row.id, stateName: row.state?.name || 'Новый', organizationName: label, organizationHref: href });
+                }
+            } catch (error) {
+                if (controller.signal.aborted || config !== orderConfig) return { ok: false, error: 'Опрос отменён: настройки изменены' };
+                failed.push(label);
+                if ([401, 403].includes(error.status)) { authFailed = true; break; }
+            }
+        }
+        if (controller.signal.aborted || config !== orderConfig) return { ok: false, error: 'Опрос отменён' };
+        if (authFailed) {
+            await orderMutate(async () => {
+                if (config !== orderConfig || controller.signal.aborted) return;
+                config.settings.enabled = false;
+                await chrome.storage.session.set({ [ORDER_SESSION_KEY]: { config, revision: ++orderRevision, subscribers: [...orderSubscribers] } });
+                await orderSetAlarm();
+            });
+        }
+        if (config !== orderConfig || controller.signal.aborted) return { ok: false, error: 'Опрос отменён' };
+        const result = { id: String(Date.now()) + '-' + orderRevision, orders: [...found.values()], failed, partial: failed.length > 0,
+            bearer: authFailed ? 'error' : failed.length === config.settings.organizationHrefs.length ? 'unknown' : 'ok', at: Date.now() };
+        result.orders.forEach(order => { order.partial = result.partial; });
+        orderLastResult = result;
+        await deliverOrderResult(result, config, controller, revision);
+        return { ok: true, result };
+    })().finally(() => { orderFlight = null; if (orderController === controller) orderController = null; });
+    return orderFlight;
+}
+if (chrome.alarms) chrome.alarms.onAlarm.addListener(alarm => {
+    if (alarm.name === 'memchat-orders') return pollOrders().catch(() => {});
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (['memchat:orders-configure', 'memchat:orders-poll', 'memchat:orders-stop'].includes(message?.type)) {
+        if (!trustedContentSender(sender)) { sendResponse({ ok: false, error: 'Запрос расширения отклонён' }); return false; }
+        const work = async () => {
+            await orderReady;
+            if (message.type === 'memchat:orders-configure') return orderMutate(() => configureOrders(message, sender));
+            if (message.type === 'memchat:orders-stop') return orderMutate(async () => {
+                if (!orderConfig || message.token !== orderConfig.token) return { ok: false, error: 'Bearer не совпадает с фоновым опросом' };
+                orderController?.abort();
+                orderConfig.settings.enabled = false;
+                await chrome.storage.session.set({ [ORDER_SESSION_KEY]: { config: orderConfig, revision: ++orderRevision, subscribers: [...orderSubscribers] } });
+                await orderSetAlarm();
+                return orderPublicConfig();
+            });
+            await orderConfigChain;
+            if (!orderConfig || message.token !== orderConfig.token) return { ok: false, error: 'Bearer не совпадает с фоновым опросом' };
+            return pollOrders();
+        };
+        work().then(sendResponse, () => sendResponse({ ok: false, error: 'Не удалось настроить фоновый опрос' }));
+        return true;
+    }
     if (message?.type === 'memchat:panel-csrf') {
         if (!trustedContentSender(sender) || (message.force !== undefined && typeof message.force !== 'boolean')) {
             sendResponse({ ok: false, error: 'Запрос расширения отклонён' });
