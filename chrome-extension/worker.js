@@ -487,7 +487,8 @@ async function pollOrders() {
                 const rows = new Map();
                 let offset = 0;
                 for (;;) {
-                    const data = await orderGet('/entity/customerorder?filter=' + encodeURIComponent('organization=' + href)
+                    const filter = ['organization=' + href, ...config.settings.statusHrefs.map(state => 'state=' + state)].join(';');
+                    const data = await orderGet('/entity/customerorder?filter=' + encodeURIComponent(filter)
                         + '&expand=state,organization&order=moment,desc&limit=100&offset=' + offset, config, controller);
                     const previous = rows.size;
                     for (const row of data.rows) {
@@ -504,7 +505,7 @@ async function pollOrders() {
                 }
             } catch (error) {
                 if (controller.signal.aborted || config !== orderConfig) return { ok: false, error: 'Опрос отменён: настройки изменены' };
-                failed.push(label);
+                failed.push(label + ' — ' + (error.message || 'Ошибка запроса'));
                 if ([401, 403].includes(error.status)) { authFailed = true; break; }
             }
         }
