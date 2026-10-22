@@ -6868,6 +6868,19 @@ if (typeof extensionStorageOnChange !== 'undefined') {
     };
 }
 // Missing/expired auth is reported by the existing core; no surprise tabs/popups.
+// The standalone userscript keeps its scheduler. In the extension, drain its
+// transient task list synchronously: no intervals, slots or shared cooldown.
+// Keep the core's cancellation/credential generation and response handling.
+if (typeof msApiPumpQueue === 'function') {
+    msApiPumpQueue = () => {
+        if (!hackerCheckCredentialScope()) return;
+        while (msApiRequestQueue.length) {
+            const task = msApiRequestQueue.shift();
+            if (task.generation !== msApiGeneration || task.token !== hackerBearerToken.trim()) task.cancel();
+            else msApiStartTask(task);
+        }
+    };
+}
 openPanelInBackground = () => {};
 
 // Extension-only notifier: content tabs configure/render; the MV3 worker polls.
@@ -7127,6 +7140,29 @@ function extensionShowAddedProducts() {
         barcodes: snapshot.internal[item.key]?.barcodes || snapshot.customer[item.key]?.barcodes || [] }));
     extensionShowProducts(added, '➕ Добавлено во внутренних заказах', snapshot.at);
 }
+// Start every required position read now; reject incomplete or old-account snapshots.
+internalOrderCheckCollectGoods = async (entity, documents) => {
+    const generation = msApiGeneration;
+    const current = () => {
+        if (generation !== msApiGeneration) throw new Error('Запрос к api.moysklad.ru отменён');
+    };
+    const outcomes = await Promise.allSettled(documents.map(async document => {
+        current();
+        const positions = await internalOrderCheckPositionRows(entity, document);
+        current();
+        return positions;
+    }));
+    current();
+    const failures = documents.filter((_document, index) => outcomes[index].status === 'rejected');
+    if (failures.length) {
+        const error = new Error(`Не удалось полностью загрузить позиции для ${failures.length} из ${documents.length} документов`);
+        error.partialFailure = true;
+        error.failedDocuments = failures.map(document => document.name || document.id || 'Без названия');
+        throw error;
+    }
+    return internalOrderCheckAggregate(outcomes.flatMap(outcome => outcome.value));
+};
+
 function extensionLoadOrderProducts() {
     if (extensionProductsFlight) return extensionProductsFlight;
     const generation = msApiGeneration;
