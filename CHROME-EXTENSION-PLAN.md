@@ -1,29 +1,40 @@
-# Memchat Chrome 8.9.0.2: задачи и приёмка
+# Memchat Chrome 8.9.0.3 — private storage and Panel session validation
 
-## Область релиза
+## Scope
 
-Extension-only изменения на базе source `17ee4c0`. Generated `js/memchat.user.js`, DEV и исходные core-модули не меняются. Рабочая копия пользователя `E:/gitreps/hatiko` с посторонним WIP не затрагивается.
+Extension-only follow-up to `8.9.0.2`. Generated `js/memchat.user.js`, `js/memchat/src/`, DEV userscript, and existing distribution userscripts stay unchanged. Production channel is the existing GitHub release/update index, not Chrome Web Store.
 
-## Задачи
+## User-visible changes
 
-1. **Единый фоновый опрос.** Перенести таймер из content tabs в service worker / chrome.alarms. Одна конфигурация на профиль; приватное session-хранилище Bearer; один flight для параллельных вызовов; отсутствие произвольного лимита общего количества заказов. Снять искусственные 500 мс именно для собственных фоновых запросов, сохранить cap=2 и серверные квоты/429/retry. Открытие вкладки не сбрасывает alarm и не перезаписывает настройки. Изменение/остановка сериализованы; устаревшая работа отменяется. Результат/звук получает одна подходящая вкладка с текущим ключом/ревизией.
-2. **Товары и штрихкоды.** «Получить товары» создаёт полный снимок выбранных заказов покупателей, агрегирует количества и строковые штрихкоды без потери начальных нулей. Внутренние заказы необязательны для основного списка. При настроенных внутренних заказах тот же снимок поддерживает «Что добавлено» — превышение их количества над заказами покупателей. Эта кнопка не обращается к сети. После изменения аккаунта/фильтров старый снимок не выдаётся за актуальный. Ошибки/неполные позиции не превращаются в пустой успешный результат.
-3. **Иконка.** Локальная PNG 128×128, manifest.icons и action.default_icon, без скачиваемого исполняемого кода. Воспроизводимый Pillow-генератор; сборка использует готовую PNG и не требует Pillow.
-4. **Соединения.** Раздельные bearer/panel индикаторы 🟢/🔴/🟡; фактическое подтверждение, ошибки авторизации и offline не смешиваются. Подсказки объясняют, что отображается последняя проверка. Нажатие повторяет проверку.
-5. **Проверка.** RED/GREEN regressions, полный Node suite, offline PowerShell/Bash updater suites, реальный packaged Chromium: два клиента/один запрос, pagination, товары/штрихкоды/added-only, неполные позиции, отсутствие страниц и настоящий alarm; main UI/top-layer/transport smoke; реальная кнопка Reload при обновлении предыдущей версии. Независимое read-only ревью перед коммитом.
-6. **Коммит и production GitHub release.** Source commit в main, отдельный dist artifact commit/tag `chrome-v8.9.0.2`, неизменяемый release ZIP. Только после доступности ZIP — descriptor commit. Read-back точных remote refs, файлов, release ZIP и SHA-256; оба существующих userscript должны остаться без изменений.
+1. Small `bearer / panel` badges replace the old `Bearer: 200 — валиден` line inside the header; no second row beneath the header divider. Each remains independently clickable.
+2. Memchat production preferences, Bearer, safe history and caches migrate from website localStorage to origin-scoped extension `chrome.storage.local`. Initialization hydrates a synchronous private adapter before executing the unchanged core.
+3. Panel CSRF acquisition confirms actual protected API access (`GET /api/search/filters`) before returning success. A login page's anonymous CSRF is insufficient. The same-profile browser cookie session is reused without copying credentials/cookies into extension storage. 401/403/419 invalidate only the matching cached token; a late response for an old token cannot invalidate a renewed token. Existing forced refresh/one API retry is retained.
 
-## Совместимость обновлятора
+## Data guarantees
 
-PNG — седьмой файл: новый **MEMCHAT_UPDATE_V2**. Новые launchers принимают V1 (6 файлов) и V2 (7 файлов) с точным allowlist и хешами. Старый V1 updater новый формат безопасно отклоняет. Для перехода один раз скачать новый ZIP, заменить файлы обновлятора рядом с прежней папкой расширения и запустить их. Путь, ID, localStorage и история сохраняются; не удалять/переустанавливать расширение.
+- Exact owned production-key allowlist, no DEV/site key deletion. Migration runs when each origin is next opened, not by silently visiting all sites.
+- Persist and semantically verify read-back before acknowledging legacy cleanup; Chrome may reorder JSON object keys. Remove a website value only if it still equals the captured snapshot.
+- Preserve conflicting legacy values in a private backup, not by rolling back canonical preferences; deleted values keep revision tombstones.
+- Origin-scoped per-key compare-and-set (revision and previous value), serialized worker writes. An optimistic queued follow-up cannot overwrite another tab's winner after a conflict.
+- `TRUSTED_CONTEXTS` enforced by Chrome; private runtime notifications target subscribed same-origin documents. No credential-bearing DOM StorageEvents.
+- Shared MS transport rechecks the canonical saved Bearer at guarded dispatch, not only a possibly stale content cache. New-key changes invalidate old-tab access.
+- Bonus/phone history is excluded from canonical records and migration backups.
+- Quota/read/write failures are explicit and fail closed; there is no persistent website-storage fallback.
+- Keep existing extension path/ID. Removing the extension erases Chrome-owned data; updater folder backups contain code only. No reverse migration of secrets into website storage for old-version rollback.
 
-## Честные границы
+## Verification
 
-- Production-канал здесь — существующий GitHub ZIP/updater. Публикация в Chrome Web Store не выполняется и не подразумевается.
-- Проверка авторизованных ответов — явно синтетические HTTP fixtures в настоящем расширении/Chromium. Live Hatiko — публичный read-only; live Panel — корректный отказ без сессии. Реальные бизнес-документы не изменяются.
-- Фоновый polling работает при запущенном Chrome после первичной настройки; session-конфигурация не переживает полное закрытие браузера. Звук/тосты требуют подходящей живой вкладки и разрешённого autoplay; ОС может задерживать alarm во сне.
-- Bash запускается на Windows через Git Bash; это не native macOS проверка. Windows symlink regression может быть пропущен при отсутствии привилегии создания symlink.
+- Standard JavaScript suite: **225 passed, 0 failed**.
+- Sequential JavaScript suite: **225 passed, 0 failed**.
+- Python updater suite: **32 run, 1 platform skip**, no failures.
+- Actual headless Chromium 151: extension load, native action/context controls, top-layer/modal/fullscreen, calculator/history/settings persistence, live public Hatiko mount, safe runtime/network allowlist and cookie transport.
+- Storage smoke with synthetic HTTP/accounts: migration preserving Bearer/safe history, unrelated site keys retained, actual `TRUSTED_CONTEXTS` access rejection, website-storage clearing, complete browser restart, origin separation, settings input changing a key in two tabs without DOM leakage.
+- Order-service smoke: shared two-tab single-flight, one receiver, real alarm polling with no tabs, product/barcode snapshot and added-only no-network view, malformed-position rejection.
+- Native Windows updater + actual Chrome reload: `8.9.0.2` to `8.9.0.3` at identical path/ID; calculator history and selected mode migrate into Chrome storage; old website keys disappear.
+- Panel: real cookie attachment confirmed through CDP Network extra-info; mocked authenticated 419-to-refresh-to-success UI flow and expired-login handling. Real unauthenticated Panel request returns a safe auth error and opens no tab.
+- Read-only inspection of the available existing browser profile found `/login` with a password form and a CSRF meta, and protected API HTTP **401**. No Panel login is present in the vault. A genuinely authenticated production-account search/bonus end-to-end test is therefore **not verified**, and no bypass is attempted. User must sign in to Panel in the same Chrome profile, then click `panel` to recheck.
+- No business records written; no actual user credentials included in tests/package. macOS-native execution is not claimed by Windows Bash checks.
 
-## Артефакты доказательств
+## Release contract
 
-`extension/dist/orders-service-smoke-report.json`, `smoke-report.json`, `updater-smoke-report.json`, `orders-service-smoke.png`; полные журналы Node/Python тестов — в Hermes scratch. При публикации основной итог проверок указывается в release notes.
+The V2 index and exact seven extension filenames remain compatible with the existing V2 updater. Build is deterministic. Publish immutable ZIP first, then advertise index; read back exact remote source/dist refs, all artifacts and the release ZIP byte-for-byte before reporting production success.

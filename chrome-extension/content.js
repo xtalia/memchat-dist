@@ -1,5 +1,104 @@
-(() => {
+(async () => {
 'use strict';
+// Bundled into worker and isolated content; never exposed in the page world.
+const MEMCHAT_STORAGE_KEYS = new Set([
+    'debug', 'calcRules_v2', 'scheduleReplacements_v1', 'scheduleCacheEnabled_v1',
+    'scheduleCache_v1_today', 'scheduleCache_v1_tomorrow', 'selectedAction_v1',
+    'showHatikoLinks_v1', 'hatikoSearchMode_v1', 'retryBehavior_v1', 'hiddenFields_v1',
+    'msQuickPanel_v1', 'floatWindowPos_v1', 'chatHistory_v1', 'clearTextDelay_v1',
+    'clearTextEnabled', 'hackerDefaultChannel_v1', 'hackerQuickButtons_v1',
+    'msMagicConfig_v1', 'msFieldsSpoilerOpen_v1', 'msReferenceCache_v1',
+    'hackerMsApi_v1', 'hackerStates_v1', 'hackerOrderNotifier_v1',
+    'hackerNotifierOrganizations_v1', 'hackerNotifierSeen_v1',
+    'hackerInternalOrderCheck_v1', 'hackerInternalOrderWarehouses_v1'
+].map(key => 'memchat:' + key).concat(['calcRules_v2', 'scheduleReplacements_v1']));
+const MEMCHAT_RETIRED_STORAGE_KEYS = new Set(['memchat:panelCsrf_v1']);
+function extensionSanitizeStoredValue(key, value) {
+    if (key === 'memchat:chatHistory_v1') {
+        try { const history = JSON.parse(value);
+            if (history && typeof history === 'object' && !Array.isArray(history)) {
+                delete history.checkHatikoBonuses;
+                return JSON.stringify(history);
+            }
+        } catch { /* Preserve malformed existing data, not a fabricated replacement. */ }
+    }
+    return value;
+}
+
+// A synchronous Storage-shaped cache for the unchanged core. Only the worker
+// persists it; websites cannot read chrome.storage or receive StorageEvents.
+const extensionStorageGate = { ready: false, error: false };
+extensionStorageGate.promise = new Promise(resolve => { extensionStorageGate.finish = resolve; });
+let extensionStorageOnError = () => {};
+let extensionStorageOnChange = () => {};
+let extensionStorageFailed = false;
+const extensionStorageItems = Object.create(null);
+function extensionStorageError() {
+    extensionStorageFailed = true;
+    extensionStorageOnError();
+    if (typeof document === 'undefined' || document.getElementById('memchatStorageError')) return;
+    const warning = document.createElement('div'); warning.id = 'memchatStorageError';
+    warning.setAttribute('role', 'alert');
+    warning.textContent = 'Memchat: данные не сохранены или изменены в другой вкладке. Перезагрузите вкладку. Хранилище сайта не используется.';
+    warning.style.cssText = 'position:fixed;top:4px;left:8px;right:8px;z-index:2147483647;padding:10px;background:#fff1f2;color:#9f1239;border:1px solid #fb7185;border-radius:8px;font:13px/1.4 sans-serif;';
+    document.body?.appendChild(warning);
+}
+function extensionApplyStorageItem(key, item) {
+    if (!MEMCHAT_STORAGE_KEYS.has(key) || !item || !Number.isSafeInteger(item.revision)
+        || (item.value !== null && typeof item.value !== 'string')) return;
+    if ((extensionStorageItems[key]?.revision || 0) > item.revision) return;
+    extensionStorageItems[key] = item;
+    extensionStorageOnChange(key);
+}
+chrome.runtime.onMessage.addListener((message, sender) => {
+    if (message?.type !== 'memchat:storage-changed' || sender.id !== chrome.runtime.id || sender.tab
+        || (sender.url && sender.url !== chrome.runtime.getURL('worker.js'))) return false;
+    extensionApplyStorageItem(message.key, message.item);
+    return false;
+});
+async function extensionInitStorage() {
+    const pageStorage = window.localStorage;
+    const legacy = {};
+    for (const key of [...MEMCHAT_STORAGE_KEYS, ...MEMCHAT_RETIRED_STORAGE_KEYS]) {
+        const value = pageStorage.getItem(key);
+        if (value !== null) legacy[key] = value;
+    }
+    const result = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'memchat:storage-init', legacy }, reply => {
+            if (chrome.runtime.lastError || !reply?.ok) reject(Error('Хранилище расширения недоступно'));
+            else resolve(reply);
+        });
+    });
+    for (const [key, item] of Object.entries(result.items)) extensionApplyStorageItem(key, item);
+    // Do not delete a value concurrently changed by a still-enabled userscript.
+    for (const key of result.cleanup) {
+        if (Object.hasOwn(legacy, key) && pageStorage.getItem(key) === legacy[key]) pageStorage.removeItem(key);
+    }
+    function change(key, raw) {
+        key = String(key);
+        if (MEMCHAT_RETIRED_STORAGE_KEYS.has(key)) return;
+        if (!MEMCHAT_STORAGE_KEYS.has(key) || extensionStorageFailed) throw Error('Хранилище Memchat недоступно');
+        const value = raw === null ? null : extensionSanitizeStoredValue(key, String(raw));
+        const previous = extensionStorageItems[key] || { value: null, revision: 0 };
+        if (previous.value === value) return;
+        extensionStorageItems[key] = { value, revision: previous.revision + 1 };
+        // Send immediately, not from a debounced page timer that can die on unload.
+        try { chrome.runtime.sendMessage({ type: 'memchat:storage-write', key, value,
+            revision: previous.revision, previousValue: previous.value }, reply => {
+            if (chrome.runtime.lastError || !reply?.ok) { extensionStorageError(); return; }
+            extensionApplyStorageItem(key, reply.item);
+        }); } catch { extensionStorageError(); }
+    }
+    return Object.freeze({
+        getItem: key => extensionStorageItems[String(key)]?.value ?? null,
+        setItem: (key, value) => change(key, String(value)),
+        removeItem: key => change(key, null),
+        key: index => Object.keys(extensionStorageItems).filter(key => extensionStorageItems[key].value !== null)[index] ?? null,
+        get length() { return Object.values(extensionStorageItems).filter(item => item.value !== null).length; }
+    });
+}
+
+try {
 // This file and the production userscript share one isolated-world IIFE.
 let extensionRequestSequence = 0;
 const extensionRequestGuards = new Map();
@@ -11,6 +110,7 @@ function GM_xmlhttpRequest(options) {
         if (finished) return;
         finished = true;
         extensionRequestGuards.delete(id);
+        if (result?.panelAuthLost && typeof extensionPanelAuthLost === 'function') extensionPanelAuthLost();
         const callback = { load: 'onload', timeout: 'ontimeout', abort: 'onabort', error: 'onerror' }[result?.event] || 'onerror';
         options[callback]?.(result?.response || { status: 0, statusText: result?.error || 'Ошибка расширения Memchat' });
     };
@@ -77,28 +177,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return false;
     }
     if (!['memchat:toggle', 'memchat:reset-position'].includes(message?.type)) return false;
-    const conflict = Boolean(document.getElementById('priceCheckContainer') && !window.priceCheckContainer);
-    if (conflict) { sendResponse({ ok: false, reason: 'conflict' }); return false; }
-    try {
-        if (message.type === 'memchat:toggle') {
-            const main = window.priceCheckContainer;
-            if (!main) createPriceCheckWindow();
-            else main.style.display = getComputedStyle(main).display === 'none' ? 'flex' : 'none';
-        } else {
-            resetFloatWindowPos();
-            const main = window.priceCheckContainer;
-            if (main) Object.assign(main.style, { left: 'auto', top: '14px', right: '14px', bottom: 'auto' });
-            document.querySelectorAll('.mc-float-window').forEach(element => {
-                ['left', 'top', 'right', 'bottom'].forEach(key => element.style.removeProperty(key));
-            });
+    const control = () => {
+        if (typeof extensionStorageGate !== 'undefined' && extensionStorageGate.error) { sendResponse({ ok: false, reason: 'storage' }); return; }
+        const conflict = Boolean(document.getElementById('priceCheckContainer') && !window.priceCheckContainer);
+        if (conflict) { sendResponse({ ok: false, reason: 'conflict' }); return; }
+        try {
+            if (message.type === 'memchat:toggle') {
+                const main = window.priceCheckContainer;
+                if (!main) createPriceCheckWindow();
+                else main.style.display = getComputedStyle(main).display === 'none' ? 'flex' : 'none';
+            } else {
+                resetFloatWindowPos();
+                const main = window.priceCheckContainer;
+                if (main) Object.assign(main.style, { left: 'auto', top: '14px', right: '14px', bottom: 'auto' });
+                document.querySelectorAll('.mc-float-window').forEach(element => {
+                    ['left', 'top', 'right', 'bottom'].forEach(key => element.style.removeProperty(key));
+                });
+            }
+            sendResponse({ ok: true });
+        } catch {
+            sendResponse({ ok: false, reason: 'failed' });
         }
-        sendResponse({ ok: true });
-    } catch {
-        sendResponse({ ok: false, reason: 'failed' });
+    };
+    if (typeof extensionStorageGate !== 'undefined' && !extensionStorageGate.ready) {
+        extensionStorageGate.promise.then(control);
+        return true;
     }
+    control();
     return false;
 });
 
+const localStorage = await extensionInitStorage();
 // Production-файл собирается из js/memchat/src/*.js.
 
 
@@ -6746,6 +6855,18 @@ loadPanelCsrf = () => '';
 savePanelCsrf = () => {};
 refreshPanelCsrf = (onSuccess, onError) => extensionPanelCsrf(onSuccess, onError, true);
 ensurePanelCsrf = (onSuccess, onError, force = false) => extensionPanelCsrf(onSuccess, onError, force === true);
+// Private cross-tab changes are not DOM StorageEvents (which sites could read).
+if (typeof extensionStorageOnChange !== 'undefined') {
+    extensionStorageOnChange = key => {
+        if (key === storageKey('hackerMsApi_v1')) hackerCheckCredentialScope();
+    };
+    extensionStorageOnError = () => {
+        hackerCredentialScopeBlocked = true;
+        hackerApiValidated = false;
+        msApiCancelAll();
+        hackerSyncAccessUi();
+    };
+}
 // Missing/expired auth is reported by the existing core; no surprise tabs/popups.
 openPanelInBackground = () => {};
 
@@ -6755,7 +6876,14 @@ let extensionOrderToken = '';
 let extensionOrderEdit = false;
 let extensionOrderSync = Promise.resolve();
 let extensionOrderLastShown = '';
-const extensionConnectionState = { panel: 'unknown', bearer: 'unknown' };
+const extensionConnectionState = { panel: 'unknown', bearer: 'unknown', panelError: '' };
+let extensionPanelCheckSequence = 0;
+function extensionPanelAuthLost() {
+    extensionPanelCheckSequence++;
+    extensionConnectionState.panel = 'error';
+    extensionConnectionState.panelError = 'Panel: сессия истекла. Войдите в panel.hatiko.ru в этом профиле Chrome.';
+    extensionRenderConnections();
+}
 function extensionMessage(message) {
     return new Promise((resolve, reject) => {
         try { chrome.runtime.sendMessage(message, result => {
@@ -6777,7 +6905,10 @@ function extensionRenderConnections() {
         const text = `${state === 'ok' ? '🟢' : state === 'error' ? '🔴' : '🟡'} ${name}`;
         if (el.textContent !== text) el.textContent = text;
         el.dataset.state = state;
-        el.title = name === 'panel' ? 'Panel: результат последней проверки сессии. Нажми для обновления.' : 'Bearer: подтверждение ключа МойСклад в этой вкладке.';
+        el.title = name === 'panel'
+            ? (extensionConnectionState.panelError || 'Panel: подтверждён доступ к защищённому API.') + ' Нажми для повторной проверки.'
+            : 'Bearer: подтверждение ключа МойСклад в этой вкладке.';
+        el.setAttribute('aria-label', el.title);
     }
 }
 function extensionAttachConnections() {
@@ -6785,7 +6916,7 @@ function extensionAttachConnections() {
     if (!main || document.getElementById('memchatConnectionStatus')) return;
     const root = document.createElement('div');
     root.id = 'memchatConnectionStatus';
-    root.style.cssText = 'display:flex;gap:10px;align-items:center;font:11px/1.4 Segoe UI,sans-serif;padding:3px 0;color:#475569;flex-shrink:0;';
+    root.style.cssText = 'display:flex;gap:9px;align-items:center;font:8.5px/1.4 Segoe UI,sans-serif;margin-top:2px;color:#475569;flex-wrap:wrap;';
     for (const name of ['bearer', 'panel']) {
         const el = document.createElement('button');
         el.type = 'button'; el.dataset.connection = name;
@@ -6796,22 +6927,40 @@ function extensionAttachConnections() {
         });
         root.appendChild(el);
     }
-    main.insertBefore(root, main.children[1] || null);
+    const oldStatus = document.getElementById('memchatBearerStatus');
+    if (oldStatus) oldStatus.replaceWith(root);
+    else document.getElementById('memchatVersion')?.after(root);
     extensionRenderConnections();
     extensionCheckPanel(false);
 }
 function extensionCheckPanel(force) {
-    extensionConnectionState.panel = 'unknown'; extensionRenderConnections();
+    const sequence = ++extensionPanelCheckSequence;
+    extensionConnectionState.panel = 'unknown';
+    extensionConnectionState.panelError = 'Panel: проверяем сессию…';
+    extensionRenderConnections();
     extensionMessage({ type: 'memchat:panel-csrf', force }).then(() => {
-        extensionConnectionState.panel = 'ok'; extensionRenderConnections();
-    }, () => { extensionConnectionState.panel = 'error'; extensionRenderConnections(); });
+        if (sequence !== extensionPanelCheckSequence) return;
+        extensionConnectionState.panel = 'ok'; extensionConnectionState.panelError = ''; extensionRenderConnections();
+    }, error => {
+        if (sequence !== extensionPanelCheckSequence) return;
+        extensionConnectionState.panel = 'error'; extensionConnectionState.panelError = error.message; extensionRenderConnections();
+    });
 }
 const extensionOriginalEnsurePanel = ensurePanelCsrf;
-ensurePanelCsrf = (success, failure, force = false) => extensionOriginalEnsurePanel(token => {
-    extensionConnectionState.panel = 'ok'; extensionRenderConnections(); success?.(token);
-}, error => {
-    extensionConnectionState.panel = 'error'; extensionRenderConnections(); failure?.(error);
-}, force);
+ensurePanelCsrf = (success, failure, force = false) => {
+    const sequence = ++extensionPanelCheckSequence;
+    return extensionOriginalEnsurePanel(token => {
+        if (sequence === extensionPanelCheckSequence) {
+            extensionConnectionState.panel = 'ok'; extensionConnectionState.panelError = ''; extensionRenderConnections();
+        }
+        success?.(token);
+    }, error => {
+        if (sequence === extensionPanelCheckSequence) {
+            extensionConnectionState.panel = 'error'; extensionConnectionState.panelError = error.message; extensionRenderConnections();
+        }
+        failure?.(error);
+    }, force);
+};
 refreshPanelCsrf = (success, failure) => ensurePanelCsrf(success, failure, true);
 const extensionOriginalNotifierBuild = hackerBuildNotifierTab;
 hackerBuildNotifierTab = (...args) => {
@@ -7185,4 +7334,6 @@ hackerBuildInternalOrderCheckTab = () => {
     window.__memchatTopLayer = { host, refresh: schedule };
 })();
 
+extensionStorageGate.ready = true; extensionStorageGate.finish();
+} catch { extensionStorageGate.error = true; extensionStorageGate.ready = true; extensionStorageGate.finish(); extensionStorageError(); }
 })();

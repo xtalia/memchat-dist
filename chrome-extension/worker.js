@@ -1,3 +1,109 @@
+// Bundled into worker and isolated content; never exposed in the page world.
+const MEMCHAT_STORAGE_KEYS = new Set([
+    'debug', 'calcRules_v2', 'scheduleReplacements_v1', 'scheduleCacheEnabled_v1',
+    'scheduleCache_v1_today', 'scheduleCache_v1_tomorrow', 'selectedAction_v1',
+    'showHatikoLinks_v1', 'hatikoSearchMode_v1', 'retryBehavior_v1', 'hiddenFields_v1',
+    'msQuickPanel_v1', 'floatWindowPos_v1', 'chatHistory_v1', 'clearTextDelay_v1',
+    'clearTextEnabled', 'hackerDefaultChannel_v1', 'hackerQuickButtons_v1',
+    'msMagicConfig_v1', 'msFieldsSpoilerOpen_v1', 'msReferenceCache_v1',
+    'hackerMsApi_v1', 'hackerStates_v1', 'hackerOrderNotifier_v1',
+    'hackerNotifierOrganizations_v1', 'hackerNotifierSeen_v1',
+    'hackerInternalOrderCheck_v1', 'hackerInternalOrderWarehouses_v1'
+].map(key => 'memchat:' + key).concat(['calcRules_v2', 'scheduleReplacements_v1']));
+const MEMCHAT_RETIRED_STORAGE_KEYS = new Set(['memchat:panelCsrf_v1']);
+function extensionSanitizeStoredValue(key, value) {
+    if (key === 'memchat:chatHistory_v1') {
+        try { const history = JSON.parse(value);
+            if (history && typeof history === 'object' && !Array.isArray(history)) {
+                delete history.checkHatikoBonuses;
+                return JSON.stringify(history);
+            }
+        } catch { /* Preserve malformed existing data, not a fabricated replacement. */ }
+    }
+    return value;
+}
+
+// Private storage is origin-scoped to preserve existing site/account separation.
+// Chrome owns persistence; page localStorage is used only for one-time migration.
+const privateStorageReady = (async () => {
+    await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' });
+})();
+// Handle initialization rejection immediately, while retaining fail-closed awaits.
+privateStorageReady.catch(() => {});
+let privateStorageChain = Promise.resolve();
+const privateStorageSubscribers = new Map();
+function privateStorageSnapshot(bucket) {
+    return JSON.stringify([bucket.version, Object.keys(bucket.items).sort().map(key =>
+        [key, bucket.items[key].revision, bucket.items[key].value]),
+    Object.keys(bucket.legacyBackup || {}).sort().map(key => [key, bucket.legacyBackup[key]])]);
+}
+async function privateStorageCredentialCurrent(sender, authorization) {
+    await privateStorageReady;
+    await privateStorageChain;
+    const key = 'memchatPrivate_v1:' + new URL(sender.url || sender.tab.url).origin;
+    const saved = (await chrome.storage.local.get(key))[key];
+    const api = JSON.parse(saved?.items['memchat:hackerMsApi_v1']?.value || '{}');
+    return api.bearerEnabled === true && typeof api.token === 'string' && authorization === 'Bearer ' + api.token;
+}
+function privateStorageMessage(message, sender) {
+    const operation = privateStorageChain.then(async () => {
+        await privateStorageReady;
+        const origin = new URL(sender.url || sender.tab.url).origin;
+        const storageKey = 'memchatPrivate_v1:' + origin;
+        const saved = (await chrome.storage.local.get(storageKey))[storageKey];
+        const bucket = saved || { version: 1, items: {}, legacyBackup: {} };
+        if (bucket.version !== 1 || !bucket.items || typeof bucket.items !== 'object') throw Error('Invalid schema');
+        if (message.type === 'memchat:storage-init') {
+            const legacy = message.legacy;
+            if (!legacy || typeof legacy !== 'object' || Array.isArray(legacy)) throw Error('Invalid legacy snapshot');
+            const cleanup = [];
+            for (const [key, raw] of Object.entries(legacy)) {
+                if (typeof raw !== 'string' || raw.length > 5 * 1024 * 1024) throw Error('Invalid value');
+                if (MEMCHAT_RETIRED_STORAGE_KEYS.has(key)) { cleanup.push(key); continue; }
+                if (!MEMCHAT_STORAGE_KEYS.has(key)) continue;
+                const value = extensionSanitizeStoredValue(key, raw);
+                if (!saved) bucket.items[key] = { value, revision: 1 };
+                else if (bucket.items[key]?.value !== value) {
+                    // An older userscript may recreate old keys. Preserve that copy
+                    // privately, but never roll back the canonical extension state.
+                    bucket.legacyBackup ||= {};
+                    bucket.legacyBackup[key] = value;
+                }
+                cleanup.push(key);
+            }
+            // Acknowledge only after Chrome commits and a read-back verifies it.
+            await chrome.storage.local.set({ [storageKey]: bucket });
+            const committed = (await chrome.storage.local.get(storageKey))[storageKey];
+            if (!committed || privateStorageSnapshot(committed) !== privateStorageSnapshot(bucket)) throw Error('Storage verification failed');
+            privateStorageSubscribers.set(sender.tab.id, { origin, documentId: sender.documentId });
+            return { ok: true, items: committed.items, cleanup };
+        }
+        if (message.type === 'memchat:storage-write') {
+            const { key, revision } = message;
+            if (!MEMCHAT_STORAGE_KEYS.has(key) || !Number.isSafeInteger(revision) || revision < 0
+                || (message.value !== null && (typeof message.value !== 'string' || message.value.length > 5 * 1024 * 1024))) throw Error('Invalid write');
+            const previous = bucket.items[key] || { value: null, revision: 0 };
+            if (previous.revision !== revision || message.previousValue !== previous.value) return { ok: false, conflict: true, item: previous,
+                error: 'Настройки изменены в другой вкладке. Перезагрузите эту вкладку.' };
+            const item = { value: message.value === null ? null : extensionSanitizeStoredValue(key, message.value), revision: revision + 1 };
+            bucket.items[key] = item;
+            await chrome.storage.local.set({ [storageKey]: bucket });
+            // Best-effort private invalidation; closed/replaced documents are ignored.
+            for (const [tabId, subscriber] of privateStorageSubscribers) {
+                if (tabId === sender.tab.id || subscriber.origin !== origin) continue;
+                const options = subscriber.documentId ? { documentId: subscriber.documentId } : { frameId: 0 };
+                chrome.tabs.sendMessage(tabId, { type: 'memchat:storage-changed', key, item }, options).catch(() => {
+                    if (privateStorageSubscribers.get(tabId) === subscriber) privateStorageSubscribers.delete(tabId);
+                });
+            }
+            return { ok: true, item };
+        }
+        throw Error('Invalid operation');
+    });
+    privateStorageChain = operation.catch(() => {});
+    return operation;
+}
+
 'use strict';
 importScripts('config.js');
 
@@ -220,7 +326,8 @@ async function performRequest(message, sender, backgroundSignal) {
                 chrome.tabs.sendMessage(sender.tab.id, { type: 'memchat:request-current', id: message.id }, { frameId: sender.frameId }),
                 new Promise(resolve => { checkTimer = setTimeout(() => resolve(null), 1000); })
             ]);
-            if (result?.current === true) return;
+            if (result?.current === true && (!isMsJsonApi(url) || typeof privateStorageCredentialCurrent !== 'function'
+                || await privateStorageCredentialCurrent(sender, headers.get('authorization')))) return;
         } catch { /* Missing/invalidated content world fails closed. */ }
         finally { clearTimeout(checkTimer); }
         entry.event = 'abort';
@@ -315,6 +422,21 @@ function startPanelSessionFlight(force) {
             }
             const token = extractPanelSessionToken(await response.text());
             if (!token || controller.signal.aborted) return { ok: false, reason: 'auth', error: 'Panel: нет авторизации. Войдите в panel.hatiko.ru в этом профиле Chrome.' };
+            // Laravel issues CSRF even for anonymous login pages. Confirm access
+            // to an actual protected read-only API with the same browser cookies.
+            const auth = await fetch('https://panel.hatiko.ru/api/search/filters', {
+                method: 'GET', headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+                credentials: 'include', cache: 'no-store', redirect: 'follow', signal: controller.signal
+            });
+            const authUrl = new URL(auth.url || 'https://panel.hatiko.ru/api/search/filters');
+            if (auth.status < 200 || auth.status >= 300 || authUrl.origin !== 'https://panel.hatiko.ru'
+                || authUrl.pathname !== '/api/search/filters' || !/application\/json/i.test(auth.headers.get('content-type') || '')) {
+                panelSession = null;
+                return { ok: false, reason: auth.status >= 500 ? 'network' : 'auth',
+                    error: 'Panel: нет доступа к API. Войдите в panel.hatiko.ru в этом профиле Chrome и нажмите panel для повторной проверки.' };
+            }
+            const proof = await auth.json();
+            if (!proof || typeof proof !== 'object' || controller.signal.aborted) throw Error('Invalid Panel auth proof');
             panelSession = { token, savedAt: Date.now() };
             return { ok: true, token };
         } catch {
@@ -511,6 +633,12 @@ if (chrome.alarms) chrome.alarms.onAlarm.addListener(alarm => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (['memchat:storage-init', 'memchat:storage-write'].includes(message?.type)) {
+        if (!trustedContentSender(sender)) { sendResponse({ ok: false, error: 'Запрос хранилища отклонён' }); return false; }
+        privateStorageMessage(message, sender).then(sendResponse,
+            () => sendResponse({ ok: false, error: 'Не удалось сохранить данные расширения. Перезагрузите вкладку; старые данные не удалены.' }));
+        return true;
+    }
     if (['memchat:orders-configure', 'memchat:orders-poll', 'memchat:orders-stop'].includes(message?.type)) {
         if (!trustedContentSender(sender)) { sendResponse({ ok: false, error: 'Запрос расширения отклонён' }); return false; }
         const work = async () => {
@@ -551,7 +679,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: true });
         return false;
     }
-    performRequest(message, sender).then(sendResponse, () => sendResponse({ event: 'error', error: 'Недопустимый запрос расширения' }));
+    performRequest(message, sender).then(result => {
+        if (result.event === 'load' && [401, 403, 419].includes(result.response?.status)
+            && new URL(message.request.url).origin === 'https://panel.hatiko.ru') {
+            const sentToken = new Headers(message.request.headers || {}).get('x-csrf-token');
+            if (sentToken && sentToken === panelSession?.token) {
+                panelSession = null;
+                result.panelAuthLost = true;
+            }
+        }
+        sendResponse(result);
+    }, () => sendResponse({ event: 'error', error: 'Недопустимый запрос расширения' }));
     return true;
 });
 
