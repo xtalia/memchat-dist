@@ -21,6 +21,10 @@ function Stop-Updater([string]$Message) {
     throw $Message
 }
 
+function Test-MemchatBuildIdentity($Info) {
+    return (($Info.source -ceq 'js/memchat.user.js') -or ($Info.source -ceq 'modules.json' -and $Info.source_kind -ceq 'extension-native'))
+}
+
 function Get-Sha256Bytes([byte[]]$Bytes) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
@@ -163,7 +167,7 @@ function Assert-SafeTarget([string]$Path) {
         if (-not $installedManifest.name -or -not $installedManifest.name.EndsWith('Memchat', [StringComparison]::OrdinalIgnoreCase)) {
             Stop-Updater 'The existing target does not identify itself as Memchat.'
         }
-        if ($installedBuild.source -cne 'js/memchat.user.js') { Stop-Updater 'The existing target is not a recognised Memchat build.' }
+        if (-not (Test-MemchatBuildIdentity $installedBuild)) { Stop-Updater 'The existing target is not a recognised Memchat build.' }
         if ($installedManifest.version -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}\.\d{1,5}$') { Stop-Updater 'The installed version is invalid.' }
         foreach ($part in ($installedManifest.version.Split('.') | ForEach-Object { [int]$_ })) {
             if ($part -gt 65535) { Stop-Updater 'An installed version component exceeds 65535.' }
@@ -235,7 +239,7 @@ function Assert-ZipAndStage([byte[]]$ArchiveBytes, [hashtable]$Index, [string]$S
     if (-not $manifest.name -or -not $manifest.name.EndsWith('Memchat', [StringComparison]::OrdinalIgnoreCase)) { Stop-Updater 'The downloaded manifest name must end with Memchat.' }
     if ($manifest.background.service_worker -cne 'worker.js') { Stop-Updater 'The downloaded background worker must be worker.js.' }
     if ($manifest.version -cne $Index['version']) { Stop-Updater 'The manifest version does not match the update index.' }
-    if ($buildInfo.source -cne 'js/memchat.user.js') { Stop-Updater 'The build-info source is not recognised.' }
+    if (-not (Test-MemchatBuildIdentity $buildInfo)) { Stop-Updater 'The build-info source is not recognised.' }
 }
 
 try {

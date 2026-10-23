@@ -132,6 +132,15 @@ compare_versions() {
       exit 0
     }'
 }
+read_build_identity() {
+    awk '
+    /"source"[[:space:]]*:/ { sources += gsub(/"source"[[:space:]]*:/, "&") }
+    /"source"[[:space:]]*:[[:space:]]*"js\/memchat\.user\.js"/ { legacy++ }
+    /"source"[[:space:]]*:[[:space:]]*"modules\.json"/ { native++ }
+    /"source_kind"[[:space:]]*:[[:space:]]*"extension-native"/ { kind++ }
+    END { exit !(sources == 1 && (legacy == 1 || (native == 1 && kind == 1))) }
+    ' "$1"
+}
 read_identity() {
     awk '
     /"manifest_version"[[:space:]]*:[[:space:]]*3([,[:space:]]|$)/ { mv++ }
@@ -148,7 +157,7 @@ if [ -e "$TARGET" ]; then
     [ -d "$TARGET" ] && [ ! -L "$TARGET" ] || fail 'existing target must be a real directory'
     [ -f "$TARGET/manifest.json" ] && [ -f "$TARGET/build-info.json" ] || fail 'refusing to replace an unrecognized target'
     CURRENT=$(read_identity "$TARGET/manifest.json") || fail 'existing target manifest is not recognized as Memchat'
-    awk 'BEGIN {ok=0} /"source"[[:space:]]*:[[:space:]]*"js\/memchat\.user\.js"/ {n++} END {if(n==1)exit 0;exit 1}' "$TARGET/build-info.json" || fail 'existing target build info is not recognized as Memchat'
+    read_build_identity "$TARGET/build-info.json" || fail 'existing target build info is not recognized as Memchat'
     case "$CURRENT" in *.*.*.*) ;; *) fail 'existing target version is invalid' ;; esac
     cmp=0
     compare_versions "$CURRENT" "$VERSION" || cmp=$?
@@ -203,7 +212,7 @@ for name in $REQUIRED_FILES; do
 done
 NEW_VERSION=$(read_identity "$EXT/manifest.json") || fail 'downloaded manifest is not a valid Memchat manifest'
 [ "$NEW_VERSION" = "$VERSION" ] || fail 'downloaded manifest version does not match index'
-awk 'BEGIN {ok=0} /"source"[[:space:]]*:[[:space:]]*"js\/memchat\.user\.js"/ {n++} END {if(n==1)exit 0;exit 1}' "$EXT/build-info.json" || fail 'downloaded build info is not a Memchat build'
+read_build_identity "$EXT/build-info.json" || fail 'downloaded build info is not a Memchat build'
 
 if [ -e "$TARGET" ]; then
     n=0
