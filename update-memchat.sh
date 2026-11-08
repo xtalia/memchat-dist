@@ -86,11 +86,11 @@ fi
 # Strictly validate the descriptor; never source or evaluate it.
 awk '
 BEGIN { valid=1 }
-NR == 1 { sub(/\r$/, "", $0); v2=($0 == "MEMCHAT_UPDATE_V2"); if ($0 != "MEMCHAT_UPDATE_V1" && !v2) valid=0; next }
+NR == 1 { sub(/\r$/, "", $0); v3=($0 == "MEMCHAT_UPDATE_V3"); v2=($0 == "MEMCHAT_UPDATE_V2" || v3); if ($0 != "MEMCHAT_UPDATE_V1" && !v2) valid=0; next }
 {
   sub(/\r$/, "", $0)
   key=substr($0,1,index($0,"=")-1); value=substr($0,index($0,"=")+1)
-  if (!(key == "version" || key == "sha256" || key == "url" || key == "file.build-info.json" || key == "file.config.js" || key == "file.content.js" || key == "file.controls.js" || key == "file.manifest.json" || key == "file.worker.js" || (v2 && key == "file.icon.png")) || seen[key]++) { valid=0; next }
+  if (!(key == "version" || key == "sha256" || key == "url" || key == "file.build-info.json" || key == "file.config.js" || key == "file.content.js" || key == "file.controls.js" || key == "file.manifest.json" || key == "file.worker.js" || (v2 && key == "file.icon.png") || (v3 && (key == "file.offscreen.html" || key == "file.audio-player.js"))) || seen[key]++) { valid=0; next }
   if (key == "version") {
     n=split(value,a,"."); if (n != 4) valid=0
     for (i=1;i<=n;i++) if (a[i] !~ /^[0-9]+$/ || length(a[i]) > 5 || a[i]+0 > 65535) valid=0
@@ -98,16 +98,19 @@ NR == 1 { sub(/\r$/, "", $0); v2=($0 == "MEMCHAT_UPDATE_V2"); if ($0 != "MEMCHAT
   else if (value !~ /^[0-9a-fA-F]+$/ || length(value) != 64) valid=0
 }
 END {
-  if (NR != 10 + v2) valid=0
+  if (NR != 10 + v2 + 2*v3) valid=0
   split("version sha256 url file.build-info.json file.config.js file.content.js file.controls.js file.manifest.json file.worker.js",required," ")
   for (i=1;i<=9;i++) if (!seen[required[i]]) valid=0
   if (v2 && !seen["file.icon.png"]) valid=0
+  if (v3 && (!seen["file.offscreen.html"] || !seen["file.audio-player.js"])) valid=0
   exit !valid
 }' "$INDEX" || fail 'invalid update index'
 
 get_value() { awk -v wanted="$1" '{ sub(/\r$/, "", $0); if (index($0,"=") && substr($0,1,index($0,"=")-1)==wanted) print substr($0,index($0,"=")+1) }' "$INDEX"; }
 REQUIRED_FILES='build-info.json config.js content.js controls.js manifest.json worker.js'
 if [ -n "$(get_value file.icon.png)" ]; then REQUIRED_FILES="$REQUIRED_FILES icon.png"; fi
+HAS_AUDIO=0
+if [ -n "$(get_value file.offscreen.html)" ]; then REQUIRED_FILES="$REQUIRED_FILES offscreen.html audio-player.js"; HAS_AUDIO=1; fi
 VERSION=$(get_value version)
 EXPECTED_URL="https://github.com/xtalia/memchat-dist/releases/download/chrome-v$VERSION/memchat-chrome.zip"
 [ "$(get_value url)" = "$EXPECTED_URL" ] || fail 'update URL does not match the publisher release URL'
@@ -173,17 +176,18 @@ if [ -e "$TARGET" ]; then
     fi
 fi
 
-# Validate every archive path before extracting only the six allowlisted members.
+# Validate every archive path before extracting only the versioned allowlist.
 command -v unzip >/dev/null 2>&1 || fail 'unzip is required'
 LIST="$WORK/zip-list.txt"
 unzip -Z1 "$ARCHIVE" > "$LIST" || fail 'cannot list ZIP archive'
-awk '
+awk -v audio="$HAS_AUDIO" '
 BEGIN {valid=1}
 {
   name=$0
   if (name ~ /\\/ || name ~ /^\// || name ~ /(^|\/)\.\.(\/|$)/ || name ~ /(^|\/)\.($|\/)/) valid=0
   if (name == "chrome-extension/") {if (seen[name]++) valid=0; next}
   if (name ~ /^chrome-extension\/(build-info\.json|config\.js|content\.js|controls\.js|manifest\.json|worker\.js|icon\.png)$/ || name ~ /^(Update-Memchat\.ps1|Update-Memchat\.cmd|update-memchat\.sh|Update-Memchat\.command|README\.md)$/) {if (seen[name]++) valid=0; next}
+  if (audio && name ~ /^chrome-extension\/(offscreen\.html|audio-player\.js)$/) {if (seen[name]++) valid=0; next}
   valid=0
 }
 END {exit !valid}' "$LIST" || fail 'ZIP contains an unknown, duplicate, or unsafe path'
