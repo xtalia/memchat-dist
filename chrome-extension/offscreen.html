@@ -1,5 +1,31 @@
 <!doctype html>
 <html lang="ru">
-<head><meta charset="utf-8"><title>Memchat · звук оповещений</title><script src="audio-player.js" defer></script></head>
-<body></body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мемный чат</title>
+<style>
+:root { color-scheme:light; font:13px/1.45 'Segoe UI',system-ui,sans-serif; color:#1f2937; background:#f8fafc; }
+body {margin:0;padding:8px;box-sizing:border-box;}
+#sidebarContext {display:flex;align-items:center;gap:8px;padding:0 4px 8px;font-size:11px;color:#64748b;}
+#sidebarStatus {flex:1;margin:0;overflow-wrap:anywhere;} #sidebarStatus[data-state=error]{color:#b91c1c;}
+#sidebarRetry {border:1px solid #cbd5e1;border-radius:6px;padding:4px 7px;background:white;color:#475569;cursor:pointer;}
+#sidebarView {position:relative;min-width:0;} #sidebarView[inert]{opacity:.55;}
+#sidebarView #priceCheckContainer {position:relative!important;inset:auto!important;width:100%!important;min-width:0!important;height:calc(100vh - 58px)!important;min-height:440px!important;max-height:none!important;resize:none!important;overflow:hidden!important;border-radius:12px!important;box-shadow:none!important;padding:10px!important;}
+#sidebarView #priceCheckHeader {cursor:default!important;}
+#sidebarView #priceCheckContainer {z-index:0!important;}
+#sidebarView .mc-float-window,#sidebarView .mc-overlay,#sidebarView #hatikoProductPicker {position:fixed!important;inset:38px 8px 8px!important;width:auto!important;max-width:none!important;max-height:none!important;margin:0!important;transform:none!important;z-index:100!important;overflow:auto!important;visibility:visible!important;}
+#sidebarView .mc-float-body {max-height:none!important;}
+#sidebarView #mcTabs {flex-wrap:wrap!important;overflow:visible!important;flex-shrink:0!important;}
+#sidebarView .mc-panel {max-width:100%;box-sizing:border-box;}
+#sidebarView input,#sidebarView select,#sidebarView textarea {max-width:100%;box-sizing:border-box;}
+#sidebarView .mc-float-header {cursor:default!important;}
+#sidebarView [hidden] {display:none!important;}
+</style>
+<script src="audio-player.js" defer></script>
+</head>
+<body hidden>
+<header id="sidebarContext"><p id="sidebarStatus" role="status" aria-live="polite">Подключаем рабочую вкладку…</p><button id="sidebarRetry" type="button" title="Повторить подключение">↻</button></header>
+<main id="sidebarView" inert aria-label="Мемный чат"></main>
+</body>
 </html>

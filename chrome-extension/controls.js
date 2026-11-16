@@ -1,6 +1,7 @@
 'use strict';
 const RESET_POSITION_MENU_ID = 'memchat-reset-position';
-const ACTION_TITLE = 'Показать / скрыть Мемчат';
+const SIDEBAR_MENU_ID = 'memchat-open-sidebar';
+const ACTION_TITLE = 'Открыть Мемчат в боковой панели';
 
 function supportedActionTab(tab) {
     if (!Number.isInteger(tab?.id)) return false;
@@ -43,8 +44,17 @@ async function runTabCommand(tab, type) {
     return result;
 }
 
-function handleActionClick(tab) { return runTabCommand(tab, 'memchat:toggle'); }
+function handleActionClick(tab) {
+    if (!Number.isInteger(tab?.windowId)) return Promise.resolve({ ok: false, reason: 'unsupported' });
+    return chrome.sidePanel.open({ windowId: tab.windowId }).then(() => ({ ok: true }),
+        () => updateActionFeedback(tab.id, { ok: false, reason: 'failed' }).then(() => ({ ok: false })));
+}
 function handleContextClick(info, tab) {
+    if (info.menuItemId === SIDEBAR_MENU_ID && Number.isInteger(tab?.windowId)) {
+        // Invoke before any await: Chrome requires the context-menu user gesture.
+        return chrome.sidePanel.open({ windowId: tab.windowId }).then(() => ({ ok: true }),
+            () => updateActionFeedback(tab.id, { ok: false, reason: 'failed' }).then(() => ({ ok: false })));
+    }
     if (info.menuItemId === RESET_POSITION_MENU_ID) return runTabCommand(tab, 'memchat:reset-position');
     return Promise.resolve({ ok: false, reason: 'unknown-menu' });
 }
@@ -55,7 +65,10 @@ function registerActionMenu() {
             if (chrome.runtime.lastError) { reject(new Error('Context menu unavailable')); return; }
             chrome.contextMenus.create({ id: RESET_POSITION_MENU_ID, title: 'Сбросить положение окон', contexts: ['action'] }, () => {
                 if (chrome.runtime.lastError) reject(new Error('Context menu unavailable'));
-                else resolve();
+                else chrome.contextMenus.create({ id: SIDEBAR_MENU_ID, title: 'Открыть боковую панель Memchat', contexts: ['action'] }, () => {
+                    if (chrome.runtime.lastError) reject(new Error('Context menu unavailable'));
+                    else resolve();
+                });
             });
         });
     });

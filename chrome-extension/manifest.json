@@ -2,9 +2,9 @@
   "manifest_version": 3,
   "name": "Хатико · Memchat",
   "description": "Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер",
-  "version": "8.9.0.11",
-  "version_name": "8.9.0-chrome.11",
-  "minimum_chrome_version": "120",
+  "version": "8.9.0.12",
+  "version_name": "2026-11-16 · beta",
+  "minimum_chrome_version": "141",
   "host_permissions": [
     "https://*.bitrix24.ru/*",
     "https://*.hatiko.ru/*",
@@ -23,13 +23,18 @@
     "storage",
     "alarms",
     "notifications",
-    "offscreen"
+    "offscreen",
+    "sidePanel",
+    "clipboardWrite"
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; media-src 'self' data:"
   },
   "background": {
     "service_worker": "worker.js"
+  },
+  "side_panel": {
+    "default_path": "offscreen.html#sidebar"
   },
   "icons": {
     "16": "icon.png",
@@ -38,7 +43,7 @@
     "128": "icon.png"
   },
   "action": {
-    "default_title": "Показать / скрыть Мемчат",
+    "default_title": "Открыть Мемчат в боковой панели",
     "default_icon": {
       "16": "icon.png",
       "32": "icon.png"
