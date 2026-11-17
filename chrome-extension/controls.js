@@ -74,7 +74,10 @@ function registerActionMenu() {
     });
 }
 
-chrome.action.onClicked.addListener(handleActionClick);
+// Chrome owns toggle state (including manual close and multiple windows).
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(error => {
+    console.error('Memchat: не удалось включить переключение боковой панели', error);
+});
 chrome.contextMenus.onClicked.addListener(handleContextClick);
 chrome.runtime.onInstalled.addListener(() => registerActionMenu().catch(() => {}));
 chrome.runtime.onStartup.addListener(() => registerActionMenu().catch(() => {}));
