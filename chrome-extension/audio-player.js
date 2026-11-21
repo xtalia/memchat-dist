@@ -102,12 +102,40 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         try { await entry.starting; entry.starting = null; }
         catch (error) { if (runtimes.get(runtime.origin) === entry) runtimes.delete(runtime.origin); frame.remove(); throw error; }
     }
-    let windowId, tabId = null, documentToken = null, generation = 0, localEdits = 0, editVersion = 0;
+    // `epoch` is RCU-style reclamation: every reset or blocking invalidation
+    // bumps it and in-flight work from an older epoch is dropped. `localEdits`
+    // separately holds apply() back while an edit is in flight, so it duplicates
+    // part of that guard rather than owning a distinct invariant.
+    let windowId, tabId = null, documentToken = null, epoch = 0, localEdits = 0, editVersion = 0;
     let chain = Promise.resolve(), polling = false, composing = false, stopped = false, retryAfter = 0, loading = 0;
     let boundActive = true, boundHost = '', boundNative = false;
+    // ETag of the last inert view the panel rendered. Sent on snapshot polls so
+    // an unchanged projection is answered with a ~60-byte reply, not 25 KB.
+    let knownHash = null;
+    // ETag outcomes are otherwise invisible while the panel runs. Record only the
+    // transitions (not every 300 ms poll) and only with the debug log enabled.
+    let etagState = null;
+    function etagOutcome(outcome, detail) {
+        if (etagState === outcome) return;
+        etagState = outcome;
+        debugRecord('debug', 'sidebar', 'etag-' + outcome, detail);
+    }
+    // A refusal that repeats is not a glitch: failed/too-large back off instead of
+    // hammering the tab every 300 ms. Any successful snapshot clears the streak.
+    let failureDelay = 0;
     // Values typed locally but not yet acknowledged by the working tab. A stale
     // poll (the tab froze or its content script reloaded) must not roll them back.
     const pendingValues = new Map();
+    // Last un-sent value per field for input events. This is the "what will be
+    // sent" buffer: newer keystrokes replace an older un-sent one, unlike
+    // pendingValues which tracks "what the user currently sees".
+    const pendingEdits = new Map();
+    // Last actual input send per field, so the first keystroke leads and only
+    // the ones inside the window are coalesced.
+    const lastInputAt = new Map();
+    const INPUT_CONFLATE_MS = 100;
+    let conflateTimer = null;
+    function clearConflate() { if (conflateTimer !== null) { clearTimeout(conflateTimer); conflateTimer = null; } }
     // Only these mean the private write path is gated; they must stay visible.
     const BLOCKING = new Set(['storage', 'conflict']);
     const errors = {
@@ -117,18 +145,31 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         closed: 'Привязанная вкладка закрыта. Нажмите ↻ для переподключения.',
         timeout: 'Рабочая вкладка не отвечает. Нажмите ↻ для переподключения.',
         failed: 'Memchat временно недоступен.',
+        'too-large': 'Страница слишком большая для боковой панели. Откройте другой документ или нажмите ↻.',
         conflict: 'Отключите Memchat в Tampermonkey и перезагрузите вкладку.',
         storage: 'Ошибка private-хранилища. Действия заблокированы; данные сайта не используются вместо него.'
     };
+    // Diagnostics only: the panel is otherwise invisible in the shared buffer, and
+    // a panel failure is exactly what a user reports. Never awaited, never chained.
+    function debugRecord(level, scope, event, detail) {
+        try {
+            chrome.runtime.sendMessage({ type: 'memchat:debug-log', level, scope, event, detail, world: 'panel' })
+                .catch(() => {});
+        } catch { /* A missing log channel cannot break the panel. */ }
+    }
     function renderStatus() {
         if (!boundHost) return;
         status.textContent = boundHost + (boundNative ? ' · без рабочей страницы' : '')
             + (boundActive ? '' : ' · неактивна');
     }
     function fail(reason, detail) {
+        debugRecord('error', 'sidebar', 'fail', { reason, tabId, documentToken: !!documentToken, host: boundHost, inert: true });
+        // A repeated permanent refusal gets its own growing delay; a transient
+        // glitch keeps the regular 300/1500 cadence.
+        if (reason === 'failed' || reason === 'too-large') failureDelay = failureDelay ? Math.min(failureDelay * 2, 5000) : 300;
         if (BLOCKING.has(reason)) {
             tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true;
-            pendingLogs.clear(); pendingValues.clear();
+            pendingLogs.clear(); pendingValues.clear(); pendingEdits.clear(); clearConflate(); knownHash = null; etagState = null;
             host.setAttribute('inert', ''); host.replaceChildren(); connections.replaceChildren(); css.textContent = '';
             boundHost = ''; boundNative = false; retryAfter = Date.now() + 1000;
             status.dataset.state = 'error'; status.textContent = errors[reason] || 'Memchat недоступен. Нажмите ↻ или перезагрузите рабочую вкладку.';
@@ -138,10 +179,18 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         if (reason === 'closed' && tabId !== null) { void bind(); return; }
         // Transient: keep the rendered view, focus, caret and scroll; only block input.
         // The binding survives, so the next poll can recover in place.
-        if (tabId === null) retryAfter = Date.now() + 1000;
+        if (tabId === null) retryAfter = Date.now() + (failureDelay || 1000);
         host.inert = true; host.setAttribute('inert', '');
-        if (boundHost) { status.dataset.state = ''; renderStatus(); }
+        // Transient reasons never turn the status red, but a refusal before the
+        // first binding must still replace the "connecting" placeholder: only the
+        // very first attempt may show it.
+        status.dataset.state = '';
         status.title = errors[reason] || 'Memchat временно недоступен.';
+        // too-large stays true for this document, so a tooltip alone would leave
+        // the panel looking healthy while every poll keeps refusing.
+        if (reason === 'too-large') status.textContent = status.title;
+        else if (boundHost) renderStatus();
+        else status.textContent = status.title;
         console.warn('[memchat:sidebar]', reason, detail);
     }
     function safeCss(value) {
@@ -218,13 +267,35 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
     }
     function apply(reply) {
+        // ETag hit: the content world and this panel agree on the exact inert
+        // projection. Reuse the rendered DOM untouched - no reconcile, no scroll,
+        // no re-render. It is still a successful poll, so it clears the failure
+        // streak and re-enables input after a transient outage.
+        if (reply?.ok && reply.view?.unchanged === true) {
+            if (reply.tabId !== tabId || reply.view.documentToken !== documentToken) return;
+            failureDelay = 0;
+            knownHash = typeof reply.view.hash === 'string' ? reply.view.hash : knownHash;
+            etagOutcome('hit', { hash: knownHash });
+            if (host.hasAttribute('inert')) { host.inert = false; host.removeAttribute('inert'); }
+            if (status.title) { status.dataset.state = ''; status.removeAttribute('title'); renderStatus(); }
+            return;
+        }
         if (!reply?.ok || !Number.isInteger(reply.tabId) || !reply.view?.ok || !Array.isArray(reply.view.nodes)) { fail(reply?.reason, reply); return; }
-        if (tabId !== reply.tabId || documentToken !== reply.view.documentToken) { pendingLogs.clear(); pendingValues.clear(); host.replaceChildren(); }
+        failureDelay = 0;
+        const previousHash = knownHash;
+        if (tabId !== reply.tabId || documentToken !== reply.view.documentToken) {
+            debugRecord('warn', 'sidebar', 'rebind-view', { from: tabId, to: reply.tabId });
+            pendingLogs.clear(); pendingValues.clear(); pendingEdits.clear(); clearConflate(); host.replaceChildren();
+        }
         tabId = reply.tabId; documentToken = reply.view.documentToken; host.dataset.tabId = String(tabId);
         boundHost = reply.host; boundNative = reply.native === true;
         status.dataset.state = ''; status.removeAttribute('title');
         renderStatus();
-        css.textContent = safeCss(reply.view.css);
+        // The ETag names the projection this panel actually shows: it is committed
+        // only after the reconcile that rendered it. If rendering throws, the DOM
+        // is only partly updated, so no ETag may survive - otherwise the next poll
+        // would be answered unchanged against a half-applied view.
+        knownHash = null;
         function findConnection(nodes) {
             for (const node of nodes) {
                 if (node.attrs?.id === 'memchatConnectionStatus') return node;
@@ -233,16 +304,29 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
             }
             return null;
         }
-        const connection = findConnection(reply.view.nodes);
-        reconcile(connections, connection ? [connection] : []);
-        // Keyed reconciliation retains focus, selection, IME state, scroll and native undo.
-        reconcile(host, reply.view.nodes);
+        try {
+            css.textContent = safeCss(reply.view.css);
+            const connection = findConnection(reply.view.nodes);
+            reconcile(connections, connection ? [connection] : []);
+            // Keyed reconciliation retains focus, selection, IME state, scroll and native undo.
+            reconcile(host, reply.view.nodes);
+        } catch (error) {
+            host.inert = true; host.setAttribute('inert', '');
+            etagOutcome('drop', { from: previousHash, reason: 'render' });
+            throw error;
+        }
+        knownHash = typeof reply.view.hash === 'string' ? reply.view.hash : null;
+        etagOutcome('miss', { from: previousHash, to: knownHash });
         host.inert = false; host.removeAttribute('inert');
         scheduleBottomFollow();
     }
     async function sendRequest(message) {
         let timer;
         try { return await Promise.race([chrome.runtime.sendMessage(message), new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Native channel timed out')), 8000); })]); }
+        catch (error) {
+            if (error?.message === 'Native channel timed out') debugRecord('error', 'sidebar', 'channel-timeout', { type: message.type, tabId });
+            throw error;
+        }
         finally { clearTimeout(timer); }
     }
     // bind() follows the window's active tab and clears the view (explicit rebind:
@@ -251,43 +335,57 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     async function run(reset) {
         loading++;
         const beforeEdits = editVersion;
-        const current = reset ? ++generation : generation;
-        if (reset) { tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true; host.setAttribute('inert', ''); pendingLogs.clear(); pendingValues.clear(); host.replaceChildren(); connections.replaceChildren(); boundHost = ''; boundNative = false; boundActive = true; status.dataset.state = ''; status.removeAttribute('title'); status.textContent = 'Подключаем рабочую вкладку…'; }
+        const current = reset ? ++epoch : epoch;
+        if (reset) { tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true; host.setAttribute('inert', ''); pendingLogs.clear(); pendingValues.clear(); pendingEdits.clear(); clearConflate(); knownHash = null; etagState = null; host.replaceChildren(); connections.replaceChildren(); boundHost = ''; boundNative = false; boundActive = true; failureDelay = 0; status.dataset.state = ''; status.removeAttribute('title'); status.textContent = 'Подключаем рабочую вкладку…'; }
         try {
             if (!Number.isInteger(windowId)) windowId = (await chrome.windows.getCurrent()).id;
-            const reply = await sendRequest({ type: 'memchat:sidebar-view', windowId, ...(reset || tabId === null ? {} : { tabId }) });
-            if (current !== generation || beforeEdits !== editVersion || localEdits || composing || stopped) return;
+            if (reset) debugRecord('info', 'sidebar', 'bind', { windowId });
+            const request = { type: 'memchat:sidebar-view', windowId, ...(reset || tabId === null ? {} : { tabId }) };
+            // Only a poll of an already-rendered binding carries an ETag; a rebind
+            // must always get a full view.
+            if (!reset && tabId !== null && knownHash !== null) {
+                request.knownHash = knownHash; request.knownDocumentToken = documentToken;
+            }
+            const reply = await sendRequest(request);
+            if (current !== epoch || beforeEdits !== editVersion || localEdits || composing || stopped) return;
             if (reply?.ok && reply.runtime) {
                 await startRuntime(reply.runtime);
-                if (current === generation && !stopped) setTimeout(() => void run(false), 50);
+                if (current === epoch && !stopped) setTimeout(() => void run(false), 50);
                 return;
             }
             apply(reply);
-        } catch { if (current === generation && !stopped) fail('timeout'); }
+        } catch { if (current === epoch && !stopped) fail('timeout'); }
         finally { loading--; }
     }
     const bind = () => run(true);
     const sync = () => run(false);
-    function send(element, event) {
-        if (tabId === null || host.hasAttribute('inert') || element.disabled || !element.dataset.mcKey) return;
-        const current = generation;
-        editVersion++;
+    // Enter can submit a search or an order, so a retried identical event must be
+    // recognizable instead of executing twice. One random id is bound to one
+    // event; a second physical press gets its own id and runs normally.
+    function eventIdentity() {
+        const bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+        return [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    }
+    function editRequest(element, event) {
         const request = { type: 'memchat:sidebar-event', windowId, tabId, documentToken,
             key: element.dataset.mcKey, event, value: String(element.value ?? ''), checked: element.checked === true,
             selected: element.localName === 'select' && element.multiple ? [...element.selectedOptions].map(option => option.value) : undefined };
-        // Remember the edit as unconfirmed until this very event is acknowledged:
-        // a poll that returns stale content in the meantime must not erase it.
-        if (event === 'input' || event === 'change' || event === 'enter') pendingValues.set(request.key, request.value);
+        if (event === 'enter') request.eventId = eventIdentity();
+        return request;
+    }
+    function enqueue(request) {
+        const current = epoch;
         localEdits++;
         chain = chain.then(async () => {
-            if (current !== generation || stopped) return;
+            if (current !== epoch || stopped) return;
             try {
                 const reply = await sendRequest(request);
-                if (current !== generation || stopped) return;
+                if (current !== epoch || stopped) return;
                 if (!reply?.ok) {
                     // Blocking gates invalidate the view; transient reasons only
                     // pause input so the rendered draft survives the next poll.
-                    if (BLOCKING.has(reply?.reason)) generation++;
+                    if (BLOCKING.has(reply?.reason)) epoch++;
                     fail(reply?.reason, reply);
                     return;
                 }
@@ -298,9 +396,57 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
                     try { await navigator.clipboard.writeText(reply.view.clipboard); }
                     catch { status.textContent = 'Не удалось скопировать. Выделите текст и нажмите Ctrl+C.'; }
                 }
-                if (localEdits === 1 && !composing) apply(reply);
-            } catch { if (current === generation) fail('timeout'); }
+                if (localEdits === 1 && !composing) {
+                    // A duplicate is a successful no-op: the content world already
+                    // ran this event and has nothing new to render.
+                    if (reply.view?.duplicate === true) return;
+                    apply(reply);
+                }
+            } catch { if (current === epoch) fail('timeout'); }
         }).finally(() => { localEdits--; });
+    }
+    // Send every queued input now, in insertion order, without adding new
+    // values. A key-limited flush keeps Enter/click ordered behind the field it
+    // commits.
+    function flushEdits(key) {
+        if (key === undefined) {
+            const now = Date.now();
+            for (const [field, entry] of pendingEdits) { lastInputAt.set(field, now); enqueue(entry); }
+            pendingEdits.clear();
+        } else {
+            const entry = pendingEdits.get(key);
+            if (entry === undefined) return;
+            pendingEdits.delete(key);
+            lastInputAt.set(key, Date.now());
+            enqueue(entry);
+        }
+        if (pendingEdits.size === 0) clearConflate();
+    }
+    function send(element, event) {
+        if (tabId === null || host.hasAttribute('inert') || element.disabled || !element.dataset.mcKey) return;
+        const request = editRequest(element, event);
+        // Fast typing is coalesced per field: the first keystroke leads, then the
+        // ones inside the window replace each other, so intermediate values never
+        // reach the page. pendingValues keeps showing the newest value meanwhile.
+        if (event === 'input') {
+            editVersion++;
+            pendingValues.set(request.key, request.value);
+            const now = Date.now();
+            if (!pendingEdits.has(request.key) && now - (lastInputAt.get(request.key) || 0) >= INPUT_CONFLATE_MS) {
+                lastInputAt.set(request.key, now);
+                enqueue(request);
+                return;
+            }
+            pendingEdits.set(request.key, request);
+            if (conflateTimer === null) conflateTimer = setTimeout(() => { conflateTimer = null; flushEdits(); }, INPUT_CONFLATE_MS);
+            return;
+        }
+        // change/enter/click are discrete commits: flush this field first, then
+        // send the commit immediately so ordering with the last edit holds.
+        if (event === 'change' || event === 'enter') pendingValues.set(request.key, request.value);
+        editVersion++;
+        flushEdits(request.key);
+        enqueue(request);
     }
     // scroll does not bubble: a manual scroll upward cancels the follow-up. Our
     // own downward write also emits scroll, so compare with the last applied top.
@@ -346,7 +492,9 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     // closed/collapsed panel still syncs, just rarely enough not to burn CPU.
     const panelDocument = document;
     const panelHidden = () => panelDocument.visibilityState === 'hidden';
-    const pollDelay = () => panelHidden() ? 3000 : boundActive ? 300 : 1500;
+    // A failing snapshot books its own growing delay instead of the regular
+    // visible cadence; the hidden interval is already slower than the first step.
+    const pollDelay = () => panelHidden() ? 3000 : failureDelay || (boundActive ? 300 : 1500);
     let nextPoll = 0;
     const timer = setInterval(async () => {
         if (stopped || loading || polling || localEdits || composing || Date.now() < nextPoll
@@ -367,7 +515,7 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     };
     panelDocument.addEventListener('visibilitychange', visibilityChanged);
     window.addEventListener('unload', () => {
-        stopped = true; generation++; clearInterval(timer);
+        stopped = true; epoch++; clearInterval(timer); clearConflate(); pendingEdits.clear();
         panelDocument.removeEventListener('visibilitychange', visibilityChanged);
         for (const handle of followHandles) {
             if (handle.raf !== undefined) cancelAnimationFrame(handle.raf);
