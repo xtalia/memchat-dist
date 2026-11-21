@@ -26,12 +26,23 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     // change must reveal the newest message, while an unchanged poll must not
     // override a manual scroll position.
     const scrolledLogs = new WeakSet();
+    // Logs last seen without any layout (a hidden schedule/hacker tab). No
+    // follow-up can ever reveal their bottom, so they are skipped until the
+    // first poll that renders them visibly again.
+    const hiddenLogs = new WeakSet();
     // A cold document has no layout when the log is first filled: scrollHeight is
     // 0 and the assignment is clipped. Keep such logs here until a later frame
     // (after CSS/fonts/layout) actually reaches the bottom.
     const pendingLogs = new Map();
     let followScheduled = false;
     const followHandles = [];
+    // Zero height on both axes means no layout at all (the log or an ancestor is
+    // display:none). It is not a cold render: that only clips scrollHeight while
+    // clientHeight still reports the visible viewport. A detached node has no
+    // geometry either but is a fresh render, so only a connected node counts.
+    function isHidden(node) {
+        return node.isConnected && node.clientHeight === 0 && node.scrollHeight === 0;
+    }
     function atBottom(node) {
         if (node.scrollHeight === 0 && node.childNodes.length > 0) return false;
         return node.scrollHeight - node.clientHeight - node.scrollTop < 2;
@@ -39,6 +50,7 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     function followPendingLogs(final) {
         for (const [node, entry] of pendingLogs) {
             if (!node.isConnected) { pendingLogs.delete(node); continue; }
+            if (isHidden(node)) { pendingLogs.delete(node); hiddenLogs.add(node); continue; }
             // The user scrolled away from the position we last applied: stop.
             if (node.scrollTop < entry.top) { pendingLogs.delete(node); continue; }
             if (atBottom(node)) { if (final) pendingLogs.delete(node); continue; }
@@ -50,6 +62,7 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         }
     }
     function scheduleBottomFollow() {
+        for (const node of pendingLogs.keys()) if (isHidden(node)) { pendingLogs.delete(node); hiddenLogs.add(node); }
         if (followScheduled || stopped || pendingLogs.size === 0) return;
         followScheduled = true;
         let remaining = 3;
@@ -92,6 +105,9 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     let windowId, tabId = null, documentToken = null, generation = 0, localEdits = 0, editVersion = 0;
     let chain = Promise.resolve(), polling = false, composing = false, stopped = false, retryAfter = 0, loading = 0;
     let boundActive = true, boundHost = '', boundNative = false;
+    // Values typed locally but not yet acknowledged by the working tab. A stale
+    // poll (the tab froze or its content script reloaded) must not roll them back.
+    const pendingValues = new Map();
     // Only these mean the private write path is gated; they must stay visible.
     const BLOCKING = new Set(['storage', 'conflict']);
     const errors = {
@@ -112,7 +128,7 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     function fail(reason, detail) {
         if (BLOCKING.has(reason)) {
             tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true;
-            pendingLogs.clear();
+            pendingLogs.clear(); pendingValues.clear();
             host.setAttribute('inert', ''); host.replaceChildren(); connections.replaceChildren(); css.textContent = '';
             boundHost = ''; boundNative = false; retryAfter = Date.now() + 1000;
             status.dataset.state = 'error'; status.textContent = errors[reason] || 'Memchat недоступен. Нажмите ↻ или перезагрузите рабочую вкладку.';
@@ -169,16 +185,30 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
                     const changed = node.childNodes.length !== chatLog.count
                         || node.scrollHeight !== chatLog.height
                         || [...node.children].map(child => child.dataset.mcKey).join(' ') !== chatLog.keys;
-                    if (changed || !scrolledLogs.has(node)) {
+                    // A log hidden behind the schedule/hacker tab has no layout at all,
+                    // so nothing can reveal its bottom and no hidden-log follow-up is
+                    // booked; its first visible render follows again instead.
+                    const shownAgain = hiddenLogs.delete(node);
+                    if (changed || shownAgain || !scrolledLogs.has(node)) {
                         node.scrollTop = node.scrollHeight;
                         scrolledLogs.add(node);
+                        if (isHidden(node)) hiddenLogs.add(node);
                         // Even when the write reports the bottom now, re-check after
                         // layout: a cold render can clip it to 0.
-                        pendingLogs.set(node, { top: node.scrollTop });
+                        else pendingLogs.set(node, { top: node.scrollTop });
                     }
                 }
                 if ('disabled' in node) node.disabled = spec.disabled === true;
-                if (typeof spec.value === 'string' && node.value !== spec.value) node.value = spec.value;
+                if (typeof spec.value === 'string') {
+                    const textField = ['input', 'textarea', 'select'].includes(node.localName);
+                    const pending = pendingValues.get(spec.key);
+                    // An unconfirmed local value wins over a stale snapshot; once the
+                    // snapshot agrees it is safe to assign and drop the mark.
+                    if (!textField || pending === undefined || pending === spec.value) {
+                        if (node.value !== spec.value) node.value = spec.value;
+                        if (textField && pending !== undefined) pendingValues.delete(spec.key);
+                    }
+                }
                 if (typeof spec.checked === 'boolean') node.checked = spec.checked;
                 if (typeof spec.selected === 'boolean') node.selected = spec.selected;
             }
@@ -189,7 +219,7 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     }
     function apply(reply) {
         if (!reply?.ok || !Number.isInteger(reply.tabId) || !reply.view?.ok || !Array.isArray(reply.view.nodes)) { fail(reply?.reason, reply); return; }
-        if (tabId !== reply.tabId || documentToken !== reply.view.documentToken) { pendingLogs.clear(); host.replaceChildren(); }
+        if (tabId !== reply.tabId || documentToken !== reply.view.documentToken) { pendingLogs.clear(); pendingValues.clear(); host.replaceChildren(); }
         tabId = reply.tabId; documentToken = reply.view.documentToken; host.dataset.tabId = String(tabId);
         boundHost = reply.host; boundNative = reply.native === true;
         status.dataset.state = ''; status.removeAttribute('title');
@@ -222,7 +252,7 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         loading++;
         const beforeEdits = editVersion;
         const current = reset ? ++generation : generation;
-        if (reset) { tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true; host.setAttribute('inert', ''); pendingLogs.clear(); host.replaceChildren(); connections.replaceChildren(); boundHost = ''; boundNative = false; boundActive = true; status.dataset.state = ''; status.removeAttribute('title'); status.textContent = 'Подключаем рабочую вкладку…'; }
+        if (reset) { tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true; host.setAttribute('inert', ''); pendingLogs.clear(); pendingValues.clear(); host.replaceChildren(); connections.replaceChildren(); boundHost = ''; boundNative = false; boundActive = true; status.dataset.state = ''; status.removeAttribute('title'); status.textContent = 'Подключаем рабочую вкладку…'; }
         try {
             if (!Number.isInteger(windowId)) windowId = (await chrome.windows.getCurrent()).id;
             const reply = await sendRequest({ type: 'memchat:sidebar-view', windowId, ...(reset || tabId === null ? {} : { tabId }) });
@@ -245,6 +275,9 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         const request = { type: 'memchat:sidebar-event', windowId, tabId, documentToken,
             key: element.dataset.mcKey, event, value: String(element.value ?? ''), checked: element.checked === true,
             selected: element.localName === 'select' && element.multiple ? [...element.selectedOptions].map(option => option.value) : undefined };
+        // Remember the edit as unconfirmed until this very event is acknowledged:
+        // a poll that returns stale content in the meantime must not erase it.
+        if (event === 'input' || event === 'change' || event === 'enter') pendingValues.set(request.key, request.value);
         localEdits++;
         chain = chain.then(async () => {
             if (current !== generation || stopped) return;
@@ -258,6 +291,9 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
                     fail(reply?.reason, reply);
                     return;
                 }
+                // Only this event's own value is confirmed: a newer local edit that
+                // landed while it was in flight stays pending.
+                if (pendingValues.get(request.key) === request.value) pendingValues.delete(request.key);
                 if (reply.view?.clipboard !== undefined) {
                     try { await navigator.clipboard.writeText(reply.view.clipboard); }
                     catch { status.textContent = 'Не удалось скопировать. Выделите текст и нажмите Ctrl+C.'; }
@@ -306,16 +342,33 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         ['onDetached', detached], ['onAttached', attached], ['onReplaced', replaced]];
     for (const [name, fn] of tabEvents) chrome.tabs[name]?.addListener?.(fn);
     document.getElementById('sidebarRetry').addEventListener('click', () => void bind());
-    // Fast polling only while the bound tab is visible; background sync stays cheap.
+    // Fast polling only while both the bound tab and this panel are visible; a
+    // closed/collapsed panel still syncs, just rarely enough not to burn CPU.
+    const panelDocument = document;
+    const panelHidden = () => panelDocument.visibilityState === 'hidden';
+    const pollDelay = () => panelHidden() ? 3000 : boundActive ? 300 : 1500;
     let nextPoll = 0;
     const timer = setInterval(async () => {
         if (stopped || loading || polling || localEdits || composing || Date.now() < nextPoll
             || (tabId === null && Date.now() < retryAfter)) return;
         polling = true;
-        try { await sync(); } finally { polling = false; nextPoll = Date.now() + (boundActive ? 300 : 1500); }
+        try { await sync(); } finally { polling = false; nextPoll = Date.now() + pollDelay(); }
     }, 300);
+    // Returning to a visible panel must catch up at once, not after the slow
+    // hidden interval; hiding it only slows the next booked poll.
+    const visibilityChanged = async () => {
+        if (stopped || panelHidden()) return;
+        // Even a poll booked under the slow hidden interval must not delay the
+        // catch-up; the regular tick picks it up if this sync cannot start now.
+        nextPoll = 0;
+        if (loading || polling || localEdits || composing || (tabId === null && Date.now() < retryAfter)) return;
+        polling = true;
+        try { await sync(); } finally { polling = false; nextPoll = Date.now() + pollDelay(); }
+    };
+    panelDocument.addEventListener('visibilitychange', visibilityChanged);
     window.addEventListener('unload', () => {
         stopped = true; generation++; clearInterval(timer);
+        panelDocument.removeEventListener('visibilitychange', visibilityChanged);
         for (const handle of followHandles) {
             if (handle.raf !== undefined) cancelAnimationFrame(handle.raf);
             else clearTimeout(handle.timer);
