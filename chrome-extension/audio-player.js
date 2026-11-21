@@ -22,6 +22,49 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     const tags = new Set('div span p br hr b strong i em small pre code ul ol li table thead tbody tr td th button input textarea select option optgroup label a details summary h1 h2 h3 h4 section header footer main nav fieldset legend'.split(' '));
     const attrs = new Set('id class title role hidden type placeholder min max step multiple rows cols size for open aria-label aria-live aria-pressed aria-selected data-tab data-tip data-state data-connection href'.split(' '));
     const runtimes = new Map();
+    // One entry per rendered chat log node: the first render and every content
+    // change must reveal the newest message, while an unchanged poll must not
+    // override a manual scroll position.
+    const scrolledLogs = new WeakSet();
+    // A cold document has no layout when the log is first filled: scrollHeight is
+    // 0 and the assignment is clipped. Keep such logs here until a later frame
+    // (after CSS/fonts/layout) actually reaches the bottom.
+    const pendingLogs = new Map();
+    let followScheduled = false;
+    const followHandles = [];
+    function atBottom(node) {
+        if (node.scrollHeight === 0 && node.childNodes.length > 0) return false;
+        return node.scrollHeight - node.clientHeight - node.scrollTop < 2;
+    }
+    function followPendingLogs(final) {
+        for (const [node, entry] of pendingLogs) {
+            if (!node.isConnected) { pendingLogs.delete(node); continue; }
+            // The user scrolled away from the position we last applied: stop.
+            if (node.scrollTop < entry.top) { pendingLogs.delete(node); continue; }
+            if (atBottom(node)) { if (final) pendingLogs.delete(node); continue; }
+            node.scrollTop = node.scrollHeight;
+            entry.top = node.scrollTop;
+            // Late layout can grow the log after the first passes: only the last
+            // bounded check retires the node, and it never reassigns once at rest.
+            if (final && atBottom(node)) pendingLogs.delete(node);
+        }
+    }
+    function scheduleBottomFollow() {
+        if (followScheduled || stopped || pendingLogs.size === 0) return;
+        followScheduled = true;
+        let remaining = 3;
+        const fire = final => {
+            if (!stopped) followPendingLogs(final);
+            if (--remaining === 0) { followScheduled = false; followHandles.length = 0; }
+        };
+        // First frame after layout, then two bounded retries for late CSS/fonts.
+        if (typeof requestAnimationFrame === 'function') {
+            const id = requestAnimationFrame(() => fire(false));
+            followHandles.push({ raf: id });
+        } else followHandles.push({ timer: setTimeout(() => fire(false), 16) });
+        followHandles.push({ timer: setTimeout(() => fire(false), 120) });
+        followHandles.push({ timer: setTimeout(() => fire(true), 400) });
+    }
     async function startRuntime(runtime) {
         const existing = runtimes.get(runtime.origin);
         if (existing?.starting) return existing.starting;
@@ -48,18 +91,42 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
     }
     let windowId, tabId = null, documentToken = null, generation = 0, localEdits = 0, editVersion = 0;
     let chain = Promise.resolve(), polling = false, composing = false, stopped = false, retryAfter = 0, loading = 0;
+    let boundActive = true, boundHost = '', boundNative = false;
+    // Only these mean the private write path is gated; they must stay visible.
+    const BLOCKING = new Set(['storage', 'conflict']);
     const errors = {
         unsupported: 'Откройте рабочую вкладку МойСклад, Bitrix24 или Hatiko.',
         changed: 'Рабочая вкладка изменилась. Нажмите ↻ для подключения.',
         missing: 'Перезагрузите рабочую вкладку после обновления расширения.',
+        closed: 'Привязанная вкладка закрыта. Нажмите ↻ для переподключения.',
+        timeout: 'Рабочая вкладка не отвечает. Нажмите ↻ для переподключения.',
+        failed: 'Memchat временно недоступен.',
         conflict: 'Отключите Memchat в Tampermonkey и перезагрузите вкладку.',
         storage: 'Ошибка private-хранилища. Действия заблокированы; данные сайта не используются вместо него.'
     };
-    function fail(reason) {
-        retryAfter = Date.now() + 1000;
-        tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true;
-        host.setAttribute('inert', ''); host.replaceChildren(); connections.replaceChildren(); css.textContent = '';
-        status.dataset.state = 'error'; status.textContent = errors[reason] || 'Memchat недоступен. Нажмите ↻ или перезагрузите рабочую вкладку.';
+    function renderStatus() {
+        if (!boundHost) return;
+        status.textContent = boundHost + (boundNative ? ' · без рабочей страницы' : '')
+            + (boundActive ? '' : ' · неактивна');
+    }
+    function fail(reason, detail) {
+        if (BLOCKING.has(reason)) {
+            tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true;
+            pendingLogs.clear();
+            host.setAttribute('inert', ''); host.replaceChildren(); connections.replaceChildren(); css.textContent = '';
+            boundHost = ''; boundNative = false; retryAfter = Date.now() + 1000;
+            status.dataset.state = 'error'; status.textContent = errors[reason] || 'Memchat недоступен. Нажмите ↻ или перезагрузите рабочую вкладку.';
+            return;
+        }
+        // Losing the bound tab legitimately rebinds to the window's active tab.
+        if (reason === 'closed' && tabId !== null) { void bind(); return; }
+        // Transient: keep the rendered view, focus, caret and scroll; only block input.
+        // The binding survives, so the next poll can recover in place.
+        if (tabId === null) retryAfter = Date.now() + 1000;
+        host.inert = true; host.setAttribute('inert', '');
+        if (boundHost) { status.dataset.state = ''; renderStatus(); }
+        status.title = errors[reason] || 'Memchat временно недоступен.';
+        console.warn('[memchat:sidebar]', reason, detail);
     }
     function safeCss(value) {
         return typeof value === 'string' && !/url\s*\(|image-set|expression|@|\\|-moz-binding/i.test(value) ? value : '';
@@ -90,9 +157,26 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
                 for (const [key, value] of Object.entries(allowed)) if (node.getAttribute(key) !== value) node.setAttribute(key, value);
                 node.dataset.mcKey = spec.key;
                 if (allowed['data-tip'] && !allowed.title) node.title = allowed['data-tip'];
-                const followBottom = node.id === 'mcChatLog' && node.scrollHeight - node.scrollTop - node.clientHeight < 40;
+                // Measure the log before its children are replaced: a grew height or a
+                // different message set means the visible content changed.
+                const chatLog = node.id === 'mcChatLog' ? {
+                    count: node.childNodes.length,
+                    height: node.scrollHeight,
+                    keys: [...node.children].map(child => child.dataset.mcKey).join(' ')
+                } : null;
                 reconcile(node, spec.children || []);
-                if (followBottom) node.scrollTop = node.scrollHeight;
+                if (chatLog) {
+                    const changed = node.childNodes.length !== chatLog.count
+                        || node.scrollHeight !== chatLog.height
+                        || [...node.children].map(child => child.dataset.mcKey).join(' ') !== chatLog.keys;
+                    if (changed || !scrolledLogs.has(node)) {
+                        node.scrollTop = node.scrollHeight;
+                        scrolledLogs.add(node);
+                        // Even when the write reports the bottom now, re-check after
+                        // layout: a cold render can clip it to 0.
+                        pendingLogs.set(node, { top: node.scrollTop });
+                    }
+                }
                 if ('disabled' in node) node.disabled = spec.disabled === true;
                 if (typeof spec.value === 'string' && node.value !== spec.value) node.value = spec.value;
                 if (typeof spec.checked === 'boolean') node.checked = spec.checked;
@@ -104,10 +188,12 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
     }
     function apply(reply) {
-        if (!reply?.ok || !Number.isInteger(reply.tabId) || !reply.view?.ok || !Array.isArray(reply.view.nodes)) { fail(reply?.reason); return; }
-        if (tabId !== reply.tabId || documentToken !== reply.view.documentToken) host.replaceChildren();
+        if (!reply?.ok || !Number.isInteger(reply.tabId) || !reply.view?.ok || !Array.isArray(reply.view.nodes)) { fail(reply?.reason, reply); return; }
+        if (tabId !== reply.tabId || documentToken !== reply.view.documentToken) { pendingLogs.clear(); host.replaceChildren(); }
         tabId = reply.tabId; documentToken = reply.view.documentToken; host.dataset.tabId = String(tabId);
-        status.dataset.state = ''; status.textContent = reply.host + (reply.native ? ' · без рабочей страницы' : '');
+        boundHost = reply.host; boundNative = reply.native === true;
+        status.dataset.state = ''; status.removeAttribute('title');
+        renderStatus();
         css.textContent = safeCss(reply.view.css);
         function findConnection(nodes) {
             for (const node of nodes) {
@@ -122,30 +208,36 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         // Keyed reconciliation retains focus, selection, IME state, scroll and native undo.
         reconcile(host, reply.view.nodes);
         host.inert = false; host.removeAttribute('inert');
+        scheduleBottomFollow();
     }
     async function sendRequest(message) {
         let timer;
         try { return await Promise.race([chrome.runtime.sendMessage(message), new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Native channel timed out')), 8000); })]); }
         finally { clearTimeout(timer); }
     }
-    async function refresh(reset = true) {
+    // bind() follows the window's active tab and clears the view (explicit rebind:
+    // first load, ↻, bound tab closed/moved). sync() polls the saved tab, keeping
+    // the rendered view, focus, caret and scroll while that tab is not active.
+    async function run(reset) {
         loading++;
         const beforeEdits = editVersion;
         const current = reset ? ++generation : generation;
-        if (reset) { tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true; host.setAttribute('inert', ''); host.replaceChildren(); connections.replaceChildren(); status.textContent = 'Подключаем рабочую вкладку…'; }
+        if (reset) { tabId = null; documentToken = null; delete host.dataset.tabId; host.inert = true; host.setAttribute('inert', ''); pendingLogs.clear(); host.replaceChildren(); connections.replaceChildren(); boundHost = ''; boundNative = false; boundActive = true; status.dataset.state = ''; status.removeAttribute('title'); status.textContent = 'Подключаем рабочую вкладку…'; }
         try {
             if (!Number.isInteger(windowId)) windowId = (await chrome.windows.getCurrent()).id;
-            const reply = await sendRequest({ type: 'memchat:sidebar-view', windowId, ...(tabId === null ? {} : { tabId }) });
+            const reply = await sendRequest({ type: 'memchat:sidebar-view', windowId, ...(reset || tabId === null ? {} : { tabId }) });
             if (current !== generation || beforeEdits !== editVersion || localEdits || composing || stopped) return;
             if (reply?.ok && reply.runtime) {
                 await startRuntime(reply.runtime);
-                if (current === generation && !stopped) setTimeout(() => void refresh(false), 50);
+                if (current === generation && !stopped) setTimeout(() => void run(false), 50);
                 return;
             }
             apply(reply);
-        } catch { if (current === generation && !stopped) fail(); }
+        } catch { if (current === generation && !stopped) fail('timeout'); }
         finally { loading--; }
     }
+    const bind = () => run(true);
+    const sync = () => run(false);
     function send(element, event) {
         if (tabId === null || host.hasAttribute('inert') || element.disabled || !element.dataset.mcKey) return;
         const current = generation;
@@ -159,15 +251,27 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
             try {
                 const reply = await sendRequest(request);
                 if (current !== generation || stopped) return;
-                if (!reply?.ok) { generation++; fail(reply?.reason); return; }
+                if (!reply?.ok) {
+                    // Blocking gates invalidate the view; transient reasons only
+                    // pause input so the rendered draft survives the next poll.
+                    if (BLOCKING.has(reply?.reason)) generation++;
+                    fail(reply?.reason, reply);
+                    return;
+                }
                 if (reply.view?.clipboard !== undefined) {
                     try { await navigator.clipboard.writeText(reply.view.clipboard); }
                     catch { status.textContent = 'Не удалось скопировать. Выделите текст и нажмите Ctrl+C.'; }
                 }
                 if (localEdits === 1 && !composing) apply(reply);
-            } catch { if (current === generation) { generation++; fail(); } }
+            } catch { if (current === generation) fail('timeout'); }
         }).finally(() => { localEdits--; });
     }
+    // scroll does not bubble: a manual scroll upward cancels the follow-up. Our
+    // own downward write also emits scroll, so compare with the last applied top.
+    host.addEventListener('scroll', event => {
+        const entry = pendingLogs.get(event.target);
+        if (entry && event.target.scrollTop < entry.top) pendingLogs.delete(event.target);
+    }, true);
     host.addEventListener('compositionstart', () => { composing = true; });
     host.addEventListener('compositionend', event => { composing = false; send(event.target, 'input'); });
     host.addEventListener('input', event => { if (!composing && !event.isComposing) send(event.target, 'input'); });
@@ -186,21 +290,40 @@ if (location.pathname === '/offscreen.html' && location.hash === '#sidebar') {
         if (target.dataset.connection === 'panel' && target.dataset.state === 'error') { void chrome.tabs.create({ url:'https://panel.hatiko.ru/' }); return; }
         if (!['input','textarea','select','option','label'].includes(target.localName)) send(target, 'click');
     });
-    const activated = info => { if (info.windowId === windowId) void refresh(); };
-    const updated = (id, change, tab) => { if ((id === tabId || (tab?.active && tab.windowId === windowId)) && (change.status || change.url)) void refresh(); };
-    const removed = (id, info) => { if (id === tabId || info.windowId === windowId) void refresh(); };
-    chrome.tabs.onActivated.addListener(activated); chrome.tabs.onUpdated.addListener(updated); chrome.tabs.onRemoved.addListener(removed);
-    document.getElementById('sidebarRetry').addEventListener('click', () => void refresh());
+    // Switching tabs must never rebind or redraw: only remember whether the bound
+    // tab is still the active one so polling can slow down while it is hidden.
+    const activated = info => {
+        if (info.windowId !== windowId || tabId === null) return; // during a rebind the new binding is the active tab
+        const active = info.tabId === tabId;
+        if (active !== boundActive) { boundActive = active; if (boundHost) renderStatus(); }
+    };
+    const updated = (id, change) => { if (id === tabId && (change.status || change.url)) void sync(); };
+    const removed = id => { if (id === tabId) void bind(); };
+    const detached = (id, info) => { if (id === tabId && info.oldWindowId === windowId) void bind(); };
+    const attached = (id, info) => { if (id === tabId && info.newWindowId === windowId) void bind(); };
+    const replaced = (added, removedId) => { if (removedId === tabId) void bind(); };
+    const tabEvents = [['onActivated', activated], ['onUpdated', updated], ['onRemoved', removed],
+        ['onDetached', detached], ['onAttached', attached], ['onReplaced', replaced]];
+    for (const [name, fn] of tabEvents) chrome.tabs[name]?.addListener?.(fn);
+    document.getElementById('sidebarRetry').addEventListener('click', () => void bind());
+    // Fast polling only while the bound tab is visible; background sync stays cheap.
+    let nextPoll = 0;
     const timer = setInterval(async () => {
-        if (stopped || loading || polling || localEdits || composing || (tabId === null && Date.now() < retryAfter)) return;
+        if (stopped || loading || polling || localEdits || composing || Date.now() < nextPoll
+            || (tabId === null && Date.now() < retryAfter)) return;
         polling = true;
-        try { await refresh(false); } finally { polling = false; }
+        try { await sync(); } finally { polling = false; nextPoll = Date.now() + (boundActive ? 300 : 1500); }
     }, 300);
     window.addEventListener('unload', () => {
         stopped = true; generation++; clearInterval(timer);
-        chrome.tabs.onActivated.removeListener(activated); chrome.tabs.onUpdated.removeListener(updated); chrome.tabs.onRemoved.removeListener(removed);
+        for (const handle of followHandles) {
+            if (handle.raf !== undefined) cancelAnimationFrame(handle.raf);
+            else clearTimeout(handle.timer);
+        }
+        followHandles.length = 0; followScheduled = false;
+        for (const [name, fn] of tabEvents) chrome.tabs[name]?.removeListener?.(fn);
     }, { once:true });
-    void refresh();
+    void bind();
 })();
 
 }

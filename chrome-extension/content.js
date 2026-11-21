@@ -1,7 +1,7 @@
 (async () => {
 'use strict';
 const chrome = globalThis.__memchatNativeChrome || globalThis.chrome;
-const MEMCHAT_EXTENSION_RELEASE = "2026-11-17 · beta";
+const MEMCHAT_EXTENSION_RELEASE = "2026-11-21 · beta";
 /* module: extension/storage-schema.js */
 // Bundled into worker and isolated content; never exposed in the page world.
 const MEMCHAT_STORAGE_KEYS = new Set([
