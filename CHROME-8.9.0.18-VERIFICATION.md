@@ -5,6 +5,15 @@ Visible version: **2026-11-22 · beta**, Chrome 141+, updater schema **MEMCHAT_U
 
 ZIP SHA-256: `3889d44c36309f33073b17a7c8a54940832c07c92733fb4d49a7d286dea1ec57`.
 
+## Public publication and online updater read-back
+
+- Published public beta: [chrome-v8.9.0.18](https://github.com/xtalia/memchat-dist/releases/tag/chrome-v8.9.0.18), immutable tag at `e39e77d45341f576e6f37aeca4f77b21cc85cbdf`.
+- Downloaded the versioned ZIP without authentication; it matches the tested ZIP byte-for-byte, and all nine declared runtime SHA-256 values match. Release notes were read back and match the submitted text.
+- Only after that verification was `main/memchat-update.txt` promoted to 8.9.0.18. Remote main runtime/index/ZIP bytes were independently read back through Git and match the tested build; `memchat.user.js` and `panel-enhancer.user.js` remain unchanged from previous main `8007fd8`.
+- The unchanged Windows reader extracted from immutable `chrome-v8.9.0.11` downloaded the real public descriptor and ZIP (no offline options or network fixtures). Online upgrade 8.9.0.16 → 8.9.0.18 passes; the exact previous nine-file installation is retained in backup at the same owned scratch target path.
+- A second online invocation passes as an integrity-checked same-version no-op without another backup. After controlled corruption of content.js in that owned target, online same-version repair passes and all nine bytes match the release again.
+- Local online report: `C:/Users/sergsinist/AppData/Local/hermes/cache/scratch/memchat-online-18-s5qi046m/report.json` (temporary scratch). No installed user extension or Chrome profile was touched; user activation still requires running the updater and clicking Reload.
+
 ## Changes since distributed 8.9.0.16
 
 - Conversation history is owned by each native sidebar document, in memory only. Close/reload starts an empty history; the autonomous input draft is no longer persisted. Settings, credentials and selected mode remain private and durable. Previously stored history is preserved but not loaded into the new chat.
