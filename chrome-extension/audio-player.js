@@ -544,9 +544,10 @@ function createSidebarHistoryOwner(changed) {
         }
         if (pendingEdits.size === 0) clearConflate();
     }
-    function send(element, event) {
+    function send(element, event, trustedGesture = false) {
         if (tabId === null || host.hasAttribute('inert') || element.disabled || !element.dataset.mcKey) return;
         const request = editRequest(element, event);
+        if (event === 'click' && trustedGesture === true) request.trustedGesture = true;
         // Fast typing is coalesced per field: the first keystroke leads, then the
         // ones inside the window replace each other, so intermediate values never
         // reach the page. pendingValues keeps showing the newest value meanwhile.
@@ -590,13 +591,13 @@ function createSidebarHistoryOwner(changed) {
         if (event.target.closest?.('[data-sidebar-chat]')) return;
         const target = event.target.closest?.('[data-mc-key]');
         if (!target || tabId === null || host.hasAttribute('inert')) return;
-        if (['hackerRepricePreview', 'hackerRepriceApply', 'hackerRepriceRecover'].includes(target.id) && !event.isTrusted) return;
+
         if (target.closest('#mcClearChatButton')) { event.preventDefault(); chat.clear(chatMode); return; }
         if (target.closest('#priceCheckCloseButton')) { event.preventDefault(); void chrome.sidePanel.close({ windowId }); return; }
         const link = target.closest('a');
         if (link) { event.preventDefault(); const url = safeHref(link.getAttribute('href')); if (url) void chrome.tabs.create({ url }); return; }
         if (target.dataset.connection === 'panel' && target.dataset.state === 'error') { void chrome.tabs.create({ url:'https://panel.hatiko.ru/' }); return; }
-        if (!['input','textarea','select','option','label'].includes(target.localName)) send(target, 'click');
+        if (!['input','textarea','select','option','label'].includes(target.localName)) send(target, 'click', event.isTrusted);
     });
     // Switching tabs must never rebind or redraw: only remember whether the bound
     // tab is still the active one so polling can slow down while it is hidden.
