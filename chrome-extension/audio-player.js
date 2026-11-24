@@ -590,6 +590,7 @@ function createSidebarHistoryOwner(changed) {
         if (event.target.closest?.('[data-sidebar-chat]')) return;
         const target = event.target.closest?.('[data-mc-key]');
         if (!target || tabId === null || host.hasAttribute('inert')) return;
+        if (['hackerRepricePreview', 'hackerRepriceApply', 'hackerRepriceRecover'].includes(target.id) && !event.isTrusted) return;
         if (target.closest('#mcClearChatButton')) { event.preventDefault(); chat.clear(chatMode); return; }
         if (target.closest('#priceCheckCloseButton')) { event.preventDefault(); void chrome.sidePanel.close({ windowId }); return; }
         const link = target.closest('a');
@@ -699,7 +700,7 @@ if (location.pathname === '/offscreen.html' && location.hash === '#runtime') {
                 // the worker owns per-attempt timeout, Retry-After and abort.
                 // A host deadline would settle the callback early and invalidate
                 // the live credential guard before the worker can retry.
-                const workerManaged = ['memchat:http', 'memchat:orders-poll'].includes(message?.type);
+                const workerManaged = ['memchat:http', 'memchat:orders-poll', 'memchat:reprice'].includes(message?.type);
                 const timer = workerManaged ? null : setTimeout(() => { pending.delete(id); reject(Error('Runtime request timed out')); }, 35000);
                 pending.set(id, { resolve, reject, timer });
                 port.postMessage({ id, message });
