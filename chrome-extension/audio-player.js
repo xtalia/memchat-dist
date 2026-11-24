@@ -483,10 +483,10 @@ function createSidebarHistoryOwner(changed) {
     // Enter can submit a search or an order, so a retried identical event must be
     // recognizable instead of executing twice. One random id is bound to one
     // event; a second physical press gets its own id and runs normally.
-    function eventIdentity() {
+    function eventIdentity(alphabet = '0123456789abcdef') {
         const bytes = new Uint8Array(16);
         crypto.getRandomValues(bytes);
-        return [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('');
+        return [...bytes].map(byte => alphabet[byte >>> 4] + alphabet[byte & 15]).join('');
     }
     function editRequest(element, event) {
         const request = { type: 'memchat:sidebar-event', windowId, tabId, documentToken,
@@ -494,6 +494,9 @@ function createSidebarHistoryOwner(changed) {
             key: element.dataset.mcKey, event, value: String(element.value ?? ''), checked: element.checked === true,
             selected: element.localName === 'select' && element.multiple ? [...element.selectedOptions].map(option => option.value) : undefined };
         if (event === 'enter') request.eventId = eventIdentity();
+        // An alphabet outside hex and decimal keeps the opaque correlation ID
+        // from being mistaken for a credential or phone by log redaction.
+        if (event === 'click') request.clickId = eventIdentity('ghijklmnopqrstuv');
         return request;
     }
     function enqueue(request) {
@@ -547,7 +550,10 @@ function createSidebarHistoryOwner(changed) {
     function send(element, event, trustedGesture = false) {
         if (tabId === null || host.hasAttribute('inert') || element.disabled || !element.dataset.mcKey) return;
         const request = editRequest(element, event);
-        if (event === 'click' && trustedGesture === true) request.trustedGesture = true;
+        if (event === 'click') {
+            if (trustedGesture === true) request.trustedGesture = true;
+            debugRecord('debug', 'sidebar', 'click-received', { clickId: request.clickId });
+        }
         // Fast typing is coalesced per field: the first keystroke leads, then the
         // ones inside the window replace each other, so intermediate values never
         // reach the page. pendingValues keeps showing the newest value meanwhile.
