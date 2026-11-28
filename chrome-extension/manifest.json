@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Хатико · Memchat",
   "description": "Мемный чат: вкладки, история по режимам, расписание «Кто/Где», настройки вкладкой, ХатикоХакер",
-  "version": "8.9.0.22",
-  "version_name": "2026-11-24 · beta",
+  "version": "8.9.0.23",
+  "version_name": "2026-11-27 · beta",
   "minimum_chrome_version": "141",
   "host_permissions": [
     "https://*.bitrix24.ru/*",
